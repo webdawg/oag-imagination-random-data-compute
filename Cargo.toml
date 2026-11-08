@@ -1,0 +1,23 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/oag-imagination",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+
+[workspace.dependencies]
+# Foundational types/signing from the base project (github.com/webdawg/open-agent-graph) --
+# reused via git dependency rather than vendored, so this repo never drifts from that one's
+# canonical JSON / domain-separated-signing conventions. Same posture as oag-mesh.
+oag-core = { git = "https://github.com/webdawg/open-agent-graph.git", branch = "main" }
+oag-crypto = { git = "https://github.com/webdawg/open-agent-graph.git", branch = "main" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+hex = "0.4"
+blake3 = "1"

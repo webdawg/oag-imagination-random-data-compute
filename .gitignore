@@ -1,0 +1,7 @@
+/target/
+**/target/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+identity.key
+.env
