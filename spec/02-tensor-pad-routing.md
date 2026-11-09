@@ -29,13 +29,19 @@ The pad is not over-designed. The mechanisms around it change it, and the traffi
 Two or more pads can be combined (added element-wise) to represent a larger neighborhood or to
 serve a request that spans more than one node's view.
 
-## Pads as data pads (not yet)
+## Pads as data pads
 
-A pad is also a unit of data. In the future, a file can be constructed from many pads -- a
-thousand pads, each holding a piece, combined to reconstruct a single file. This is the same
-"pads can be combined" idea, extended from serving a request to serving a file. The data-pad
-mechanism is not built yet; the base project's `spec/23-tensor-pad-and-evolution-layer.md` records
-it as the future shape the pad is designed to allow.
+A pad is also a unit of data. A file is split into many shards (a thousand by default), each
+attached to a different node's pad, and a manifest names which pad holds which shard. To
+reconstruct the file, gather the pads in manifest order and concatenate the shards.
+
+`datapad::split` and `datapad::reconstruct` implement this. A manifest that promises a thousand
+pads names a thousand pads -- a small file leaves the tail of them empty. A missing shard, an
+out-of-order shard, or a hash mismatch is an error, not a guess.
+
+The gathering -- querying each node for its pad -- uses whichever carrier is available; the
+split and reconstruction are carrier-independent. See the base project's
+`spec/23-tensor-pad-and-evolution-layer.md` for the same idea recorded at the base layer.
 
 ## What this explicitly is not
 

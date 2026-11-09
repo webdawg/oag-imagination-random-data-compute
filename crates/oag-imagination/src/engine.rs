@@ -18,6 +18,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::datapad::Shard;
+
 pub const CONTRIBUTION_DOMAIN: &[u8] = b"OAG-IMAGINATION:CONTRIBUTION:v1:";
 pub const ROUTE_DOMAIN: &[u8] = b"OAG-IMAGINATION:ROUTE:v1:";
 pub const PAD_DIM: usize = 32;
@@ -168,6 +170,8 @@ pub struct Engine {
     pub pad: Vec<f32>,
     pub neighbors: Vec<String>,
     pub dreams: DreamLog,
+    /// The data shard this node holds, if any -- the pad's data-pad role.
+    pub shard: Option<Shard>,
 }
 
 /// What a node did with a request.
@@ -183,7 +187,16 @@ pub enum HandleOutcome {
 
 impl Engine {
     pub fn new(node_id: String, pad: Vec<f32>, neighbors: Vec<String>) -> Self {
-        Self { node_id, pad, neighbors, dreams: DreamLog::new() }
+        Self { node_id, pad, neighbors, dreams: DreamLog::new(), shard: None }
+    }
+
+    /// This node's data pad: its routing weights plus its shard, if it holds one.
+    pub fn data_pad(&self) -> crate::datapad::DataPad {
+        crate::datapad::DataPad {
+            pad_id: self.node_id.clone(),
+            values: self.pad.clone(),
+            shard: self.shard.clone(),
+        }
     }
 
     /// Processes a request: adds this node's contribution, then either answers it (if `resolver`

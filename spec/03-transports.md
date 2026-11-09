@@ -6,8 +6,14 @@ The engine is transport-agnostic. This file lists the carriers.
 
 ## TCP (implemented)
 
-A thin length-prefixed JSON protocol over TCP. A request enters a node; the node routes it; the
-final response carries the chain back. `socket::serve` and `socket::send`.
+A thin length-prefixed JSON protocol over TCP. A message is either an imagination `Request` (the
+routing engine) or a `PadRequest`/`PadResponse` pair (the data-pad gathering path).
+
+- `socket::serve` / `socket::serve_on` -- serve the engine; route requests onward and return the
+  chain; answer a `PadRequest` with the node's data pad.
+- `socket::send` -- send a request and read the response.
+- `socket::gather_file` -- ask each node for its pad, gather the shards in manifest order, and
+  reconstruct the file. A missing pad is an error, not a guess.
 
 ## Reticulum (not yet)
 

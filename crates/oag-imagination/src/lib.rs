@@ -14,11 +14,16 @@
 //!
 //! See `spec/01-overview.md`, `spec/02-tensor-pad-routing.md`, and `spec/03-transports.md`.
 
+pub mod datapad;
 pub mod engine;
 pub mod socket;
 
+pub use datapad::{
+    attach, gather, reconstruct, split, split_to_pads, DataPad, DataPadError, FileManifest, Shard,
+    DEFAULT_SHARD_COUNT,
+};
 pub use engine::{
     chain_contribution, combine_pads, reinforce, route, Contribution, DreamLog, Engine, EngineError,
     HandleOutcome, Request, CONTRIBUTION_DOMAIN, PAD_DIM, ROUTE_DOMAIN,
 };
-pub use socket::{read_request, send, serve, write_request, MAX_MESSAGE_BYTES};
+pub use socket::{gather_file, read_message, send, serve, serve_on, write_message, Message, PadRequest, MAX_MESSAGE_BYTES};
