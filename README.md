@@ -23,10 +23,12 @@ this handles synthetic data and computation.
 
 ## Status
 
-The random beacon (`spec/02-random-beacon.md`) is implemented: a verifiable, signed,
-deterministic sequence of random values derived from a published genesis seed. The dream log
-(`spec/03-dream-log.md`) and dream compute (`spec/04-dream-compute.md`) are specified but not
-yet built.
+The routing engine (`spec/02-tensor-pad-routing.md`) is implemented, over TCP
+(`spec/03-transports.md`). A request enters a node, the node uses its tensor pad to pick the
+next hop, each hop adds a contribution, and the final response carries the whole metadata chain
+back. Reticulum, IPFS, and tunnels are the same engine over a different carrier, not yet built.
+
+The founding statements are recorded verbatim in `USER_INPUT_RECORD.md`.
 
 ## License
 

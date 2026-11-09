@@ -1,0 +1,15 @@
+[package]
+name = "oag-imagination"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+oag-core.workspace = true
+oag-crypto.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+hex.workspace = true
+blake3.workspace = true
+tokio.workspace = true
