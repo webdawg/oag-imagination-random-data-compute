@@ -87,6 +87,26 @@ impl DreamLog {
     pub fn is_empty(&self) -> bool {
         self.dreams.is_empty()
     }
+
+    /// Every dream whose request target matches `target` -- a responder (or an
+    /// operator) asking "what has this node been asked for".
+    pub fn for_target(&self, target: &serde_json::Value) -> Vec<&Request> {
+        self.dreams.iter().filter(|d| d.target == *target).collect()
+    }
+
+    /// Every dream whose chain includes `node_id` -- "what has this node
+    /// contributed to".
+    pub fn for_node(&self, node_id: &str) -> Vec<&Request> {
+        self.dreams
+            .iter()
+            .filter(|d| d.contributions.iter().any(|c| c.node_id == node_id))
+            .collect()
+    }
+
+    /// The most recent dream, if any.
+    pub fn last(&self) -> Option<&Request> {
+        self.dreams.last()
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -266,6 +286,24 @@ mod tests {
             contributions: vec![],
             answer: None,
         }
+    }
+
+    #[tokio::test]
+    async fn the_dream_log_queries_by_target_and_node() {
+        let mut engine = Engine::new("node-a".to_string(), vec![1.0; PAD_DIM], vec!["node-b".to_string()]);
+        let mut resolver = LocalResolver::new();
+        resolver.insert("target", serde_json::json!("answer"));
+        resolver.insert("other-target", serde_json::json!("answer"));
+        let mut first = request("req-q1");
+        engine.handle(&mut first, &resolver).await;
+        let mut second = request("req-q2");
+        second.target = serde_json::json!("other-target");
+        engine.handle(&mut second, &resolver).await;
+
+        let target = serde_json::json!("target");
+        assert_eq!(engine.dreams.for_target(&target).len(), 1);
+        assert_eq!(engine.dreams.for_node("node-a").len(), 2);
+        assert_eq!(engine.dreams.last().unwrap().id, "req-q2");
     }
 
     #[tokio::test]
