@@ -40,26 +40,39 @@ reply to the client itself; the carrier is for the local answer.
 unchanged; only the path to the target changes -- the "tunnel existing protocols" carrier. A
 real minimal proxy (CONNECT then forward) is used in the test.
 
+## HTTP (implemented)
+
+`HttpTransport` POSTs the message as JSON to `<address>/oag-imagination/v1/message` and reads
+the JSON reply -- the carrier that lets the engine talk to an HTTP API (the base project's REST
+surface) rather than a raw socket.
+
+## IPFS (implemented)
+
+Both directions, over the same `Transport` trait. `IpfsTransport` reads: the address is a CID and
+the message published there is the reply. `PublishingIpfsTransport` writes: it publishes the
+message via the `IpfsPublisher` seam (`HttpIpfsPublisher` posts to `/api/v0/add`) and returns the
+CID as the answer. `CidResolver`/`HttpGatewayFetcher` answer `Target::Cid` by fetching through an
+IPFS HTTP gateway.
+
+## Tunnels (implemented)
+
+`ProxiedTransport` (above) is the tunnel carrier. There is no separate "tunnels" carrier
+beyond it.
+
 ## Reticulum (not yet)
 
 The same engine over a Reticulum `Link`. The base project already has a Reticulum transport
-(`oag-reticulum`); the imagination engine uses the same carrier.
-
-## IPFS (not yet)
-
-The same engine over IPFS. A request can be a CID; the engine routes it over IPFS.
-
-## Tunnels (not yet)
-
-The same engine tunneling existing protocols.
+(`oag-reticulum`); the imagination engine uses the same carrier. `ReticulumCarrier` is the seam
+and the adapter is not written.
 
 ## The carrier trait
 
 `socket::Transport` is the seam: `fn send(&self, address, message) -> a future returning the
-reply`. `TcpTransport` implements it; a test in `socket.rs` implements it in memory. Reticulum,
-IPFS, and tunnels implement the same trait -- a carrier only moves a message and returns the
-reply; the routing logic is the engine's, not the carrier's. `send_with` and `gather_file_with`
-take an explicit carrier.
+reply`. `TcpTransport` implements it; a test in `socket.rs` implements it in memory. The HTTP,
+tunnel, and IPFS carriers implement the same trait -- a carrier only moves a message and returns
+the reply; the routing logic is the engine's, not the carrier's. `send_with` and
+`gather_file_with` take an explicit carrier. `ReticulumCarrier` is a second, Option-returning
+seam for the one carrier whose transport has no built-in implementation yet.
 
 ## What this explicitly is not
 
