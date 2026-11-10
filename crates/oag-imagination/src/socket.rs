@@ -183,6 +183,93 @@ impl Transport for ProxiedTransport {
     }
 }
 
+/// A seam for publishing a message to IPFS and getting its CID. The base project's
+/// `PinningProvider` (or any IPFS client) adapts to this trait.
+pub trait IpfsPublisher: Send + Sync {
+    fn publish<'a>(
+        &'a self,
+        message: &'a Message,
+    ) -> Pin<Box<dyn Future<Output = Option<String>> + Send + 'a>>;
+}
+
+/// Publishes via an IPFS HTTP API (`POST /api/v0/add`).
+#[derive(Debug)]
+pub struct HttpIpfsPublisher {
+    api: String,
+    client: reqwest::Client,
+}
+
+impl HttpIpfsPublisher {
+    pub fn new(api: impl Into<String>) -> Self {
+        Self { api: api.into(), client: reqwest::Client::new() }
+    }
+}
+
+impl IpfsPublisher for HttpIpfsPublisher {
+    fn publish<'a>(
+        &'a self,
+        message: &'a Message,
+    ) -> Pin<Box<dyn Future<Output = Option<String>> + Send + 'a>> {
+        Box::pin(async move {
+            let bytes = serde_json::to_vec(message).ok()?;
+            let part = reqwest::multipart::Part::bytes(bytes).file_name("message");
+            let form = reqwest::multipart::Form::new().part("file", part);
+            let response = self
+                .client
+                .post(format!("{}/api/v0/add", self.api.trim_end_matches('/')))
+                .multipart(form)
+                .send()
+                .await
+                .ok()?;
+            if !response.status().is_success() {
+                return None;
+            }
+            let body = response.text().await.ok()?;
+            let parsed: serde_json::Value = serde_json::from_str(&body).ok()?;
+            parsed.get("Hash").and_then(|h| h.as_str()).map(|s| s.to_string())
+        })
+    }
+}
+
+/// A carrier that publishes the message to IPFS and returns the CID as the answer -- the
+/// write half of the IPFS carrier, against `IpfsTransport`'s read half.
+pub struct PublishingIpfsTransport<P: IpfsPublisher> {
+    publisher: P,
+}
+
+impl<P: IpfsPublisher> std::fmt::Debug for PublishingIpfsTransport<P> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PublishingIpfsTransport").finish()
+    }
+}
+
+impl<P: IpfsPublisher> PublishingIpfsTransport<P> {
+    pub fn new(publisher: P) -> Self {
+        Self { publisher }
+    }
+}
+
+impl<P: IpfsPublisher> Transport for PublishingIpfsTransport<P> {
+    fn send<'a>(
+        &'a self,
+        _address: &'a str,
+        message: &'a Message,
+    ) -> Pin<Box<dyn Future<Output = std::io::Result<Message>> + Send + 'a>> {
+        Box::pin(async move {
+            let cid = self
+                .publisher
+                .publish(message)
+                .await
+                .ok_or_else(|| std::io::Error::other("publish failed"))?;
+            let mut response = message.clone();
+            if let Message::Request(ref mut request) = response {
+                request.answer = Some(serde_json::json!({ "cid": cid }));
+            }
+            Ok(response)
+        })
+    }
+}
+
 /// A carrier that retrieves a message from IPFS by CID: the address is the CID, and the
 /// message published at that CID is the response. Uses the same `CidFetcher` seam as
 /// `CidResolver`, so the base project's `PinningProvider` plugs in without the IPFS crate.
@@ -520,6 +607,39 @@ mod tests {
 
         handle_a.abort();
         handle_b.abort();
+    }
+
+    #[tokio::test]
+    async fn a_message_is_published_to_ipfs_and_returns_its_cid() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // A minimal IPFS HTTP API: accepts the add and returns a Hash.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 8192];
+            let _ = stream.read(&mut buf).await;
+            let body = "{\"Hash\": \"QmPublished\"}";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        });
+
+        let transport =
+            PublishingIpfsTransport::new(HttpIpfsPublisher::new(format!("http://{addr}")));
+        let response = transport
+            .send("ignored", &Message::Request(request("req-pub")))
+            .await
+            .unwrap();
+        let Message::Request(response) = response else {
+            panic!("expected a request message");
+        };
+        assert_eq!(response.answer, Some(serde_json::json!({ "cid": "QmPublished" })));
+        let _ = handle.await;
     }
 
     #[tokio::test]
