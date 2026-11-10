@@ -21,6 +21,16 @@ from verifiable randomness.
 This layer is **parallel** to `oag-mesh`, not above it: the mesh handles real data and claims,
 this handles synthetic data and computation.
 
+## Running it
+
+```bash
+cargo run --example node -- <oag.sqlite> <node-peer-id-hex> <listen-addr>
+```
+
+The adapter reads the node's tensor pad and peer list from the `oag` database; the engine
+serves imagination requests over TCP. A node with no pad yet starts empty, and the peers come
+from `oag`'s own `peers`/`peer_addresses` tables -- nothing is configured here.
+
 ## Status
 
 The routing engine (`spec/02-tensor-pad-routing.md`) is implemented, over TCP

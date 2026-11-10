@@ -418,6 +418,40 @@ impl PeerFetcher for HttpPeerFetcher {
     }
 }
 
+/// A resolver backed by a shared map, handling both reads and writes for `Target::Store` --
+/// the "storing information" case. A `null` payload is a read; any other payload is a write.
+#[derive(Debug, Default, Clone)]
+pub struct StoreResolver {
+    entries: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, serde_json::Value>>>,
+}
+
+impl StoreResolver {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl Resolver for StoreResolver {
+    fn resolve<'a>(
+        &'a self,
+        target: &'a Target,
+        payload: &'a serde_json::Value,
+    ) -> Pin<Box<dyn Future<Output = Option<serde_json::Value>> + Send + 'a>> {
+        Box::pin(async move {
+            let Target::Store(key) = target else {
+                return None;
+            };
+            let mut entries = self.entries.lock().await;
+            if payload.is_null() {
+                entries.get(key).cloned()
+            } else {
+                entries.insert(key.clone(), payload.clone());
+                Some(serde_json::json!({ "stored": key }))
+            }
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -458,6 +492,19 @@ mod tests {
     async fn a_url_resolver_answers_only_url_targets() {
         let resolver = UrlResolver::new();
         assert_eq!(resolver.resolve(&Target::Store("k".into()), &serde_json::json!({})).await, None);
+    }
+
+    #[tokio::test]
+    async fn a_store_resolver_reads_and_writes() {
+        let resolver = StoreResolver::new();
+        let target = Target::Store("key".into());
+        let write = resolver.resolve(&target, &serde_json::json!("value")).await.unwrap();
+        assert_eq!(write, serde_json::json!({ "stored": "key" }));
+        let read = resolver
+            .resolve(&target, &serde_json::Value::Null)
+            .await
+            .unwrap();
+        assert_eq!(read, serde_json::json!("value"));
     }
 
     #[tokio::test]
