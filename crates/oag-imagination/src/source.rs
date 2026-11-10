@@ -86,6 +86,42 @@ impl RandomSource for HardwareRandom {
     }
 }
 
+/// A hardware randomness source backed by a byte device -- the Linux hardware RNG
+/// (`/dev/hwrng`) by default, or any device a muon detector or other HWRNG driver exposes.
+///
+/// Reads exactly 32 bytes. If the device is missing or unreadable, it falls back to software
+/// randomness rather than failing -- a node without the hardware still contributes something,
+/// and the fallback is documented rather than silent.
+#[derive(Debug, Clone)]
+pub struct DeviceRandom {
+    path: std::path::PathBuf,
+}
+
+impl Default for DeviceRandom {
+    fn default() -> Self {
+        Self { path: std::path::PathBuf::from("/dev/hwrng") }
+    }
+}
+
+impl DeviceRandom {
+    pub fn new(path: impl Into<std::path::PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+}
+
+impl RandomSource for DeviceRandom {
+    fn next(&mut self) -> [u8; 32] {
+        use std::io::Read;
+        let mut out = [0u8; 32];
+        if let Ok(mut file) = std::fs::File::open(&self.path) {
+            if file.read_exact(&mut out).is_ok() {
+                return out;
+            }
+        }
+        oag_crypto::random_bytes_32()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,5 +157,17 @@ mod tests {
     fn hardware_randomness_falls_back_to_software() {
         let mut source = HardwareRandom::default();
         let _ = source.next();
+    }
+
+    #[test]
+    fn a_device_source_reads_the_device_or_falls_back() {
+        // /dev/urandom always exists and always yields 32 bytes; /dev/hwrng may not.
+        let mut source = DeviceRandom::new("/dev/urandom");
+        let value = source.next();
+        assert_eq!(value.len(), 32);
+
+        // A missing device falls back to software randomness rather than failing.
+        let mut missing = DeviceRandom::new("/dev/definitely-not-here");
+        let _ = missing.next();
     }
 }

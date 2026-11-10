@@ -35,7 +35,7 @@ pub use socket::{
     UdpTransport, MAX_DATAGRAM_BYTES, MAX_MESSAGE_BYTES,
 };
 pub use node::{NodeAdapter, NodeError};
-pub use source::{HardwareRandom, MixedSource, RandomSource, SoftwareRandom};
+pub use source::{DeviceRandom, HardwareRandom, MixedSource, RandomSource, SoftwareRandom};
 pub use target::{
     CidFetcher, CidResolver, CompositeResolver, FnResolver, HttpGatewayFetcher, HttpPeerFetcher,
     LocalResolver, PeerFetcher, PeerResolver, Resolver, StoreResolver, Target,
