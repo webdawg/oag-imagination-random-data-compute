@@ -285,6 +285,74 @@ impl CidFetcher for HttpGatewayFetcher {
     }
 }
 
+/// The receipt half of the base project's transfer protocol, verified here rather than trusted.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnsignedReceipt {
+    pub cid: String,
+    pub server_peer_id: String,
+    pub server_public_key: String,
+    pub client_nonce: String,
+    pub server_nonce: String,
+    pub content_hash: String,
+    pub receipt_hash: String,
+    pub served_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Receipt {
+    #[serde(flatten)]
+    pub unsigned: UnsignedReceipt,
+    pub server_signature: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ReceiptError {
+    #[error("hex decoding failed: {0}")]
+    Hex(#[from] hex::FromHexError),
+    #[error("bad signature encoding")]
+    BadSignatureEncoding,
+    #[error("signature verification failed")]
+    BadSignature,
+    #[error("the receipt's client nonce does not match this exchange")]
+    ClientNonceMismatch,
+    #[error("the receipt's content hash does not match the fetched bytes")]
+    ContentHashMismatch,
+    #[error("serialization failed: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("internal error: {0}")]
+    Internal(String),
+}
+
+/// Verifies a transfer receipt: the client nonce matches this exchange, the content hash matches
+/// the fetched bytes, and the server signature is valid over the canonical unsigned receipt.
+pub fn verify_receipt(
+    receipt: &Receipt,
+    client_nonce: &[u8; 32],
+    content: &[u8],
+    server_public_key: &oag_crypto::VerifyingKey,
+) -> Result<(), ReceiptError> {
+    if receipt.unsigned.client_nonce != hex::encode(client_nonce) {
+        return Err(ReceiptError::ClientNonceMismatch);
+    }
+    if receipt.unsigned.content_hash != oag_crypto::blake3_content_hash(content) {
+        return Err(ReceiptError::ContentHashMismatch);
+    }
+    let canonical = oag_core::canonical_json_bytes(&receipt.unsigned)
+        .map_err(|e| ReceiptError::Internal(e.to_string()))?;
+    let sig_bytes = hex::decode(&receipt.server_signature)?;
+    let sig_array: [u8; 64] = sig_bytes.try_into().map_err(|_| ReceiptError::BadSignatureEncoding)?;
+    let signature = oag_crypto::Signature::from_bytes(&sig_array);
+    oag_crypto::verify_with_domain(
+        server_public_key,
+        TRANSFER_RECEIPT_DOMAIN,
+        &canonical,
+        &signature,
+    )
+    .map_err(|_| ReceiptError::BadSignature)
+}
+
+pub const TRANSFER_RECEIPT_DOMAIN: &str = "OAG:TRANSFER_RECEIPT:v1:";
+
 /// A seam for fetching a CID from a peer. The base project's transfer protocol
 /// (`POST /oag/transfer/v1/fetch`) adapts to this trait; `HttpPeerFetcher` is the built-in
 /// implementation, which signs the request with the node's own identity.
@@ -294,6 +362,17 @@ pub trait PeerFetcher: Send + Sync {
         peer: &'a str,
         cid: &'a str,
     ) -> Pin<Box<dyn Future<Output = Option<Vec<u8>>> + Send + 'a>>;
+
+    /// The same fetch plus the server's receipt, when the carrier exposes it. The default drops
+    /// the receipt; `HttpPeerFetcher` returns it from the `x-oag-transfer-receipt` header.
+    #[allow(clippy::type_complexity)]
+    fn fetch_with_receipt<'a>(
+        &'a self,
+        peer: &'a str,
+        cid: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Option<(Vec<u8>, Option<Receipt>)>> + Send + 'a>> {
+        Box::pin(async move { self.fetch(peer, cid).await.map(|bytes| (bytes, None)) })
+    }
 }
 
 /// Answers `Target::Peer` by fetching the request payload's CID from that peer.
@@ -406,6 +485,17 @@ impl PeerFetcher for HttpPeerFetcher {
         cid: &'a str,
     ) -> Pin<Box<dyn Future<Output = Option<Vec<u8>>> + Send + 'a>> {
         Box::pin(async move {
+            let (bytes, _) = self.fetch_with_receipt(peer, cid).await?;
+            Some(bytes)
+        })
+    }
+
+    fn fetch_with_receipt<'a>(
+        &'a self,
+        peer: &'a str,
+        cid: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Option<(Vec<u8>, Option<Receipt>)>> + Send + 'a>> {
+        Box::pin(async move {
             let nonce = oag_crypto::random_bytes_32();
             let request = build_transfer_request(&self.identity, cid, &nonce);
             let url = format!("{}/oag/transfer/v1/fetch", peer.trim_end_matches('/'));
@@ -413,7 +503,12 @@ impl PeerFetcher for HttpPeerFetcher {
             if !response.status().is_success() {
                 return None;
             }
-            Some(response.bytes().await.ok()?.to_vec())
+            let receipt = response
+                .headers()
+                .get("x-oag-transfer-receipt")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|raw| serde_json::from_str::<Receipt>(raw).ok());
+            Some((response.bytes().await.ok()?.to_vec(), receipt))
         })
     }
 }
@@ -492,6 +587,41 @@ mod tests {
     async fn a_url_resolver_answers_only_url_targets() {
         let resolver = UrlResolver::new();
         assert_eq!(resolver.resolve(&Target::Store("k".into()), &serde_json::json!({})).await, None);
+    }
+
+    #[test]
+    fn a_receipt_is_verified_against_the_exchange() {
+        let server = oag_crypto::PeerIdentity::generate();
+        let content = b"the file bytes";
+        let client_nonce = oag_crypto::random_bytes_32();
+        let server_nonce = oag_crypto::random_bytes_32();
+
+        let content_hash = oag_crypto::blake3_content_hash(content);
+        let receipt_hash =
+            oag_crypto::mutual_receipt_hash(&client_nonce, &server_nonce, &content_hash);
+        let unsigned = UnsignedReceipt {
+            cid: "QmTest".into(),
+            server_peer_id: server.peer_id().to_string(),
+            server_public_key: hex::encode(server.verifying_key().to_bytes()),
+            client_nonce: hex::encode(client_nonce),
+            server_nonce: hex::encode(server_nonce),
+            content_hash,
+            receipt_hash,
+            served_at: 1_700_000_000,
+        };
+        let canonical = oag_core::canonical_json_bytes(&unsigned).unwrap();
+        let signature = oag_crypto::sign_with_domain(
+            server.signing_key(),
+            TRANSFER_RECEIPT_DOMAIN,
+            &canonical,
+        );
+        let receipt = Receipt { unsigned, server_signature: hex::encode(signature.to_bytes()) };
+
+        verify_receipt(&receipt, &client_nonce, content, &server.verifying_key()).unwrap();
+
+        let wrong_nonce = oag_crypto::random_bytes_32();
+        assert!(verify_receipt(&receipt, &wrong_nonce, content, &server.verifying_key()).is_err());
+        assert!(verify_receipt(&receipt, &client_nonce, b"tampered", &server.verifying_key()).is_err());
     }
 
     #[tokio::test]
