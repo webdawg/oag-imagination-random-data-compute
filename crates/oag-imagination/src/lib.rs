@@ -35,4 +35,7 @@ pub use socket::{
 };
 pub use node::{NodeAdapter, NodeError};
 pub use source::{HardwareRandom, MixedSource, RandomSource, SoftwareRandom};
-pub use target::{CompositeResolver, FnResolver, LocalResolver, Resolver, Target};
+pub use target::{
+    CidFetcher, CidResolver, CompositeResolver, FnResolver, HttpGatewayFetcher, HttpPeerFetcher,
+    LocalResolver, PeerFetcher, PeerResolver, Resolver, Target, TRANSFER_REQUEST_DOMAIN,
+};

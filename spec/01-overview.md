@@ -36,6 +36,15 @@ a kind from a JSON value -- a convenience, not a validation.
 Resolvers are async, because a remote target (a URL, a CID, a peer) is fetched, not looked up:
 
 - `UrlResolver` -- answers `Url` by fetching it over HTTP and returning the status and body.
+- `CidResolver` -- answers `Cid` by fetching the CID through a `CidFetcher`. The light
+  built-in is `HttpGatewayFetcher` (`<gateway>/ipfs/<cid>`); the base project's
+  `PinningProvider` adapts to the same `CidFetcher` trait, so the imagination layer does not
+  depend on the IPFS crate.
+- `PeerResolver` -- answers `Peer` by fetching the request payload's CID from that peer through
+  a `PeerFetcher`. `HttpPeerFetcher` calls the base project's transfer protocol
+  (`POST /oag/transfer/v1/fetch`), signing the request with this node's identity and matching
+  the base project's `UnsignedTransferRequest` shape. The receipt travels in a header; this
+  fetcher returns the bytes and leaves receipt verification to the caller.
 - `LocalResolver` -- a map-backed store answering `Store` and `Query`.
 - `CompositeResolver` -- tries each resolver in order, first answer wins.
 - `FnResolver` -- adapts a synchronous closure, for tests and simple cases.

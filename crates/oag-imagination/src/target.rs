@@ -202,6 +202,222 @@ where
     }
 }
 
+/// A seam for fetching a CID's bytes. The imagination layer does not depend on the IPFS crate;
+/// the base project's `PinningProvider` (or any IPFS client) adapts to this trait, and
+/// `HttpGatewayFetcher` is the light built-in implementation.
+pub trait CidFetcher: Send + Sync {
+    fn fetch<'a>(
+        &'a self,
+        cid: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Option<Vec<u8>>> + Send + 'a>>;
+}
+
+/// Answers `Target::Cid` by fetching the CID through a `CidFetcher`.
+pub struct CidResolver<F: CidFetcher> {
+    fetcher: F,
+}
+
+impl<F: CidFetcher> CidResolver<F> {
+    pub fn new(fetcher: F) -> Self {
+        Self { fetcher }
+    }
+}
+
+impl<F: CidFetcher> std::fmt::Debug for CidResolver<F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CidResolver").finish()
+    }
+}
+
+impl<F: CidFetcher> Resolver for CidResolver<F> {
+    fn resolve<'a>(
+        &'a self,
+        target: &'a Target,
+        _payload: &'a serde_json::Value,
+    ) -> Pin<Box<dyn Future<Output = Option<serde_json::Value>> + Send + 'a>> {
+        Box::pin(async move {
+            let Target::Cid(cid) = target else {
+                return None;
+            };
+            let bytes = self.fetcher.fetch(cid).await?;
+            Some(serde_json::json!({
+                "cid": cid,
+                "length": bytes.len(),
+                "body": String::from_utf8_lossy(&bytes),
+            }))
+        })
+    }
+}
+
+/// The light built-in `CidFetcher`: fetch a CID from an IPFS HTTP gateway
+/// (`<gateway>/ipfs/<cid>`). A deployment that runs its own node can adapt the base project's
+/// `PinningProvider` to `CidFetcher` instead.
+pub struct HttpGatewayFetcher {
+    gateway: String,
+    client: reqwest::Client,
+}
+
+impl std::fmt::Debug for HttpGatewayFetcher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpGatewayFetcher").field("gateway", &self.gateway).finish()
+    }
+}
+
+impl HttpGatewayFetcher {
+    pub fn new(gateway: impl Into<String>) -> Self {
+        Self { gateway: gateway.into(), client: reqwest::Client::new() }
+    }
+}
+
+impl CidFetcher for HttpGatewayFetcher {
+    fn fetch<'a>(
+        &'a self,
+        cid: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Option<Vec<u8>>> + Send + 'a>> {
+        Box::pin(async move {
+            let url = format!("{}/ipfs/{}", self.gateway.trim_end_matches('/'), cid);
+            let response = self.client.get(url).send().await.ok()?;
+            if !response.status().is_success() {
+                return None;
+            }
+            Some(response.bytes().await.ok()?.to_vec())
+        })
+    }
+}
+
+/// A seam for fetching a CID from a peer. The base project's transfer protocol
+/// (`POST /oag/transfer/v1/fetch`) adapts to this trait; `HttpPeerFetcher` is the built-in
+/// implementation, which signs the request with the node's own identity.
+pub trait PeerFetcher: Send + Sync {
+    fn fetch<'a>(
+        &'a self,
+        peer: &'a str,
+        cid: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Option<Vec<u8>>> + Send + 'a>>;
+}
+
+/// Answers `Target::Peer` by fetching the request payload's CID from that peer.
+pub struct PeerResolver<F: PeerFetcher> {
+    fetcher: F,
+}
+
+impl<F: PeerFetcher> PeerResolver<F> {
+    pub fn new(fetcher: F) -> Self {
+        Self { fetcher }
+    }
+}
+
+impl<F: PeerFetcher> std::fmt::Debug for PeerResolver<F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PeerResolver").finish()
+    }
+}
+
+impl<F: PeerFetcher> Resolver for PeerResolver<F> {
+    fn resolve<'a>(
+        &'a self,
+        target: &'a Target,
+        payload: &'a serde_json::Value,
+    ) -> Pin<Box<dyn Future<Output = Option<serde_json::Value>> + Send + 'a>> {
+        Box::pin(async move {
+            let Target::Peer(peer) = target else {
+                return None;
+            };
+            let cid = payload.as_str()?;
+            let bytes = self.fetcher.fetch(peer, cid).await?;
+            Some(serde_json::json!({
+                "peer": peer,
+                "cid": cid,
+                "length": bytes.len(),
+                "body": String::from_utf8_lossy(&bytes),
+            }))
+        })
+    }
+}
+
+pub const TRANSFER_REQUEST_DOMAIN: &str = "OAG:TRANSFER_REQUEST:v1:";
+
+#[derive(Debug, Serialize)]
+struct UnsignedTransferRequest {
+    cid: String,
+    client_peer_id: String,
+    client_public_key: String,
+    client_nonce: String,
+    requested_at: i64,
+    #[serde(default)]
+    relay_hops_remaining: u8,
+    #[serde(default)]
+    relay_path: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct TransferRequest {
+    #[serde(flatten)]
+    unsigned: UnsignedTransferRequest,
+    signature: String,
+}
+
+fn now_unix() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()
+        as i64
+}
+
+/// Builds a signed transfer request, matching the base project's `build_and_sign_request`.
+fn build_transfer_request(identity: &oag_crypto::PeerIdentity, cid: &str, nonce: &[u8; 32]) -> TransferRequest {
+    let unsigned = UnsignedTransferRequest {
+        cid: cid.to_string(),
+        client_peer_id: identity.peer_id().to_string(),
+        client_public_key: hex::encode(identity.verifying_key().to_bytes()),
+        client_nonce: hex::encode(nonce),
+        requested_at: now_unix(),
+        relay_hops_remaining: 0,
+        relay_path: vec![],
+    };
+    let canonical = oag_core::canonical_json_bytes(&unsigned).expect("UnsignedTransferRequest always serializes");
+    let signature =
+        oag_crypto::sign_with_domain(identity.signing_key(), TRANSFER_REQUEST_DOMAIN, &canonical);
+    TransferRequest { unsigned, signature: hex::encode(signature.to_bytes()) }
+}
+
+/// The built-in `PeerFetcher`: `POST /oag/transfer/v1/fetch` with a request signed by this node's
+/// identity, returning the content body. The receipt travels in a header; this fetcher returns the
+/// bytes and leaves receipt verification to the caller.
+pub struct HttpPeerFetcher {
+    client: reqwest::Client,
+    identity: oag_crypto::PeerIdentity,
+}
+
+impl std::fmt::Debug for HttpPeerFetcher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpPeerFetcher").finish()
+    }
+}
+
+impl HttpPeerFetcher {
+    pub fn new(identity: oag_crypto::PeerIdentity) -> Self {
+        Self { client: reqwest::Client::new(), identity }
+    }
+}
+
+impl PeerFetcher for HttpPeerFetcher {
+    fn fetch<'a>(
+        &'a self,
+        peer: &'a str,
+        cid: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Option<Vec<u8>>> + Send + 'a>> {
+        Box::pin(async move {
+            let nonce = oag_crypto::random_bytes_32();
+            let request = build_transfer_request(&self.identity, cid, &nonce);
+            let url = format!("{}/oag/transfer/v1/fetch", peer.trim_end_matches('/'));
+            let response = self.client.post(&url).json(&request).send().await.ok()?;
+            if !response.status().is_success() {
+                return None;
+            }
+            Some(response.bytes().await.ok()?.to_vec())
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,6 +458,68 @@ mod tests {
     async fn a_url_resolver_answers_only_url_targets() {
         let resolver = UrlResolver::new();
         assert_eq!(resolver.resolve(&Target::Store("k".into()), &serde_json::json!({})).await, None);
+    }
+
+    #[tokio::test]
+    async fn a_peer_resolver_fetches_a_cid_from_a_peer() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        // A minimal transfer server: reads the request, returns a body.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf).await;
+            let body = "peer content";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        });
+
+        let identity = oag_crypto::PeerIdentity::generate();
+        let resolver = PeerResolver::new(HttpPeerFetcher::new(identity));
+        let target = Target::Peer(format!("http://{addr}"));
+        let answer = resolver
+            .resolve(&target, &serde_json::json!("QmTest"))
+            .await
+            .unwrap();
+        assert_eq!(answer["peer"], format!("http://{addr}"));
+        assert_eq!(answer["body"], "peer content");
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_cid_resolver_fetches_through_an_http_gateway() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        // A minimal IPFS gateway serving /ipfs/<cid>.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf).await;
+            let body = "the file bytes";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        });
+
+        let resolver = CidResolver::new(HttpGatewayFetcher::new(format!("http://{addr}")));
+        let target = Target::Cid("QmTest".into());
+        let answer = resolver.resolve(&target, &serde_json::json!({})).await.unwrap();
+        assert_eq!(answer["cid"], "QmTest");
+        assert_eq!(answer["body"], "the file bytes");
+        handle.await.unwrap();
     }
 
     #[tokio::test]
