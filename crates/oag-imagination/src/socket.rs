@@ -109,6 +109,29 @@ pub async fn send_with(
     }
 }
 
+/// A test HTTP endpoint: reads one POST body and returns the message with an answer filled in.
+#[cfg(test)]
+async fn http_endpoint(mut stream: TcpStream) -> std::io::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut buf = [0u8; 8192];
+    let n = stream.read(&mut buf).await?;
+    let text = String::from_utf8_lossy(&buf[..n]).to_string();
+    // The body starts after the first blank line.
+    let body = text.split("\r\n\r\n").nth(1).unwrap_or("");
+    let mut message: Message = serde_json::from_str(body).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    if let Message::Request(ref mut request) = message {
+        request.answer = Some(serde_json::json!("over http"));
+    }
+    let out = serde_json::to_vec(&message)?;
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        out.len()
+    );
+    stream.write_all(response.as_bytes()).await?;
+    stream.write_all(&out).await?;
+    Ok(())
+}
+
 /// A carrier that tunnels another carrier through an HTTP CONNECT proxy: connect to the proxy,
 /// ask it to open a tunnel to the target, then run the inner carrier's exchange over it. This is
 /// the "tunnel existing protocols" carrier -- the inner carrier is unchanged; only the path to
@@ -192,6 +215,49 @@ impl<F: crate::target::CidFetcher> Transport for IpfsTransport<F> {
                 .await
                 .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "CID not found"))?;
             serde_json::from_slice(&bytes)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        })
+    }
+}
+
+/// An HTTP carrier: POST the message as JSON to an endpoint and read the JSON reply. This is
+/// the carrier that lets the engine talk to an HTTP API -- the base project's REST surface --
+/// rather than a raw socket. The endpoint is `<address>/oag-imagination/v1/message`.
+#[derive(Debug, Default)]
+pub struct HttpTransport {
+    client: reqwest::Client,
+}
+
+impl HttpTransport {
+    pub fn new() -> Self {
+        Self { client: reqwest::Client::new() }
+    }
+}
+
+impl Transport for HttpTransport {
+    fn send<'a>(
+        &'a self,
+        address: &'a str,
+        message: &'a Message,
+    ) -> Pin<Box<dyn Future<Output = std::io::Result<Message>> + Send + 'a>> {
+        Box::pin(async move {
+            let url = format!("{}/oag-imagination/v1/message", address.trim_end_matches('/'));
+            let response = self
+                .client
+                .post(&url)
+                .json(message)
+                .send()
+                .await
+                .map_err(std::io::Error::other)?;
+            if !response.status().is_success() {
+                return Err(std::io::Error::other(format!(
+                    "endpoint returned {}",
+                    response.status()
+                )));
+            }
+            response
+                .json()
+                .await
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
         })
     }
@@ -454,6 +520,27 @@ mod tests {
 
         handle_a.abort();
         handle_b.abort();
+    }
+
+    #[tokio::test]
+    async fn a_message_travels_over_http() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = http_endpoint(stream).await;
+        });
+
+        let transport = HttpTransport::new();
+        let response = transport
+            .send(&format!("http://{addr}"), &Message::Request(request("req-http")))
+            .await
+            .unwrap();
+        let Message::Request(response) = response else {
+            panic!("expected a request message");
+        };
+        assert_eq!(response.answer, Some(serde_json::json!("over http")));
+        let _ = handle.await;
     }
 
     #[tokio::test]

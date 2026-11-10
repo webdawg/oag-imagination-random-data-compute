@@ -32,7 +32,7 @@ pub use engine::{
 };
 pub use socket::{
     gather_file, gather_file_with, read_message, send, send_with, serve, serve_on, serve_udp,
-    serve_udp_on, write_message, IpfsTransport, Message, PadRequest, ProxiedTransport,
+    serve_udp_on, write_message, HttpTransport, IpfsTransport, Message, PadRequest, ProxiedTransport,
     ReticulumCarrier, TcpTransport, Transport, UdpTransport, MAX_DATAGRAM_BYTES,
     MAX_MESSAGE_BYTES,
 };
