@@ -31,8 +31,8 @@ pub use engine::{
 };
 pub use socket::{
     gather_file, gather_file_with, read_message, send, send_with, serve, serve_on, serve_udp,
-    serve_udp_on, write_message, IpfsTransport, Message, PadRequest, TcpTransport, Transport,
-    UdpTransport, MAX_DATAGRAM_BYTES, MAX_MESSAGE_BYTES,
+    serve_udp_on, write_message, IpfsTransport, Message, PadRequest, ProxiedTransport, TcpTransport,
+    Transport, UdpTransport, MAX_DATAGRAM_BYTES, MAX_MESSAGE_BYTES,
 };
 pub use node::{NodeAdapter, NodeError};
 pub use source::{DeviceRandom, HardwareRandom, MixedSource, RandomSource, SoftwareRandom};

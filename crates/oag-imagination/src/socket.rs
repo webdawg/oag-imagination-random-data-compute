@@ -109,6 +109,57 @@ pub async fn send_with(
     }
 }
 
+/// A carrier that tunnels another carrier through an HTTP CONNECT proxy: connect to the proxy,
+/// ask it to open a tunnel to the target, then run the inner carrier's exchange over it. This is
+/// the "tunnel existing protocols" carrier -- the inner carrier is unchanged; only the path to
+/// the target changes.
+pub struct ProxiedTransport {
+    proxy: String,
+}
+
+impl std::fmt::Debug for ProxiedTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProxiedTransport").field("proxy", &self.proxy).finish()
+    }
+}
+
+impl ProxiedTransport {
+    pub fn new(proxy: impl Into<String>) -> Self {
+        Self { proxy: proxy.into() }
+    }
+
+    /// Strips a scheme from an address, leaving `host:port` for the CONNECT request.
+    fn target(address: &str) -> &str {
+        address
+            .trim_start_matches("http://")
+            .trim_start_matches("https://")
+    }
+}
+
+impl Transport for ProxiedTransport {
+    fn send<'a>(
+        &'a self,
+        address: &'a str,
+        message: &'a Message,
+    ) -> Pin<Box<dyn Future<Output = std::io::Result<Message>> + Send + 'a>> {
+        Box::pin(async move {
+            let target = Self::target(address).to_string();
+            let mut stream = TcpStream::connect(&self.proxy).await?;
+            let connect = format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n");
+            stream.write_all(connect.as_bytes()).await?;
+            let mut buf = [0u8; 1024];
+            let n = stream.read(&mut buf).await?;
+            let response = String::from_utf8_lossy(&buf[..n]);
+            if !response.starts_with("HTTP/1.1 200") && !response.starts_with("HTTP/1.0 200") {
+                return Err(std::io::Error::other("tunnel was not established"));
+            }
+            // The tunnel is up; run the inner carrier's exchange over it.
+            write_message(&mut stream, message).await?;
+            read_message(&mut stream).await
+        })
+    }
+}
+
 /// A carrier that retrieves a message from IPFS by CID: the address is the CID, and the
 /// message published at that CID is the response. Uses the same `CidFetcher` seam as
 /// `CidResolver`, so the base project's `PinningProvider` plugs in without the IPFS crate.
@@ -305,7 +356,7 @@ mod tests {
     use crate::target::{CidFetcher, FnResolver, Target};
     use std::future::Future;
     use std::pin::Pin;
-    use tokio::net::UdpSocket;
+    use tokio::net::{TcpListener, TcpStream, UdpSocket};
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
@@ -387,6 +438,45 @@ mod tests {
 
         handle_a.abort();
         handle_b.abort();
+    }
+
+    #[tokio::test]
+    async fn a_message_travels_through_an_http_connect_tunnel() {
+        // The target answers the message.
+        let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target_listener.local_addr().unwrap();
+        let target_handle = tokio::spawn(async move {
+            let (mut stream, _) = target_listener.accept().await.unwrap();
+            let Message::Request(mut request) = read_message(&mut stream).await.unwrap() else {
+                return;
+            };
+            request.answer = Some(serde_json::json!("via tunnel"));
+            write_message(&mut stream, &Message::Request(request)).await.unwrap();
+        });
+
+        // The proxy: read CONNECT, connect to the target, establish, forward.
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let proxy_handle = tokio::spawn(async move {
+            let (mut client, _) = proxy_listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = client.read(&mut buf).await;
+            let mut target = TcpStream::connect(target_addr).await.unwrap();
+            let _ = client.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await;
+            let _ = tokio::io::copy_bidirectional(&mut client, &mut target).await;
+        });
+
+        let transport = ProxiedTransport::new(proxy_addr.to_string());
+        let response = transport
+            .send(&format!("http://{target_addr}"), &Message::Request(request("req-tunnel")))
+            .await
+            .unwrap();
+        let Message::Request(response) = response else {
+            panic!("expected a request message");
+        };
+        assert_eq!(response.answer, Some(serde_json::json!("via tunnel")));
+        let _ = target_handle.await;
+        let _ = proxy_handle.await;
     }
 
     #[tokio::test]
