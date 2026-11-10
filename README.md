@@ -33,10 +33,17 @@ from `oag`'s own `peers`/`peer_addresses` tables -- nothing is configured here.
 
 ## Status
 
-The routing engine (`spec/02-tensor-pad-routing.md`) is implemented, over TCP
+The routing engine (`spec/02-tensor-pad-routing.md`) is implemented, over TCP and UDP
 (`spec/03-transports.md`). A request enters a node, the node uses its tensor pad to pick the
 next hop, each hop adds a contribution, and the final response carries the whole metadata chain
-back. Reticulum, IPFS, and tunnels are the same engine over a different carrier, not yet built.
+back.
+
+Carriers are the same engine over a different transport (`socket::Transport`): TCP, UDP, HTTP
+(`HttpTransport`), an HTTP `CONNECT` tunnel (`ProxiedTransport`), and IPFS in both directions
+(`IpfsTransport` reads by CID, `PublishingIpfsTransport` publishes and returns the CID). A
+Reticulum carrier is a seam (`ReticulumCarrier`) -- the base project's `oag-reticulum` transport
+adapts to it, so this layer does not depend on the Reticulum crate. No carrier is configured:
+the node reads its pad and peers from `oag`'s own database.
 
 The founding statements are recorded verbatim in `USER_INPUT_RECORD.md`.
 

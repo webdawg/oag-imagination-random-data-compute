@@ -7,7 +7,7 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::engine::Request;
+    use crate::engine::{Engine, Request, PAD_DIM};
     use crate::socket::{send, serve_on};
     use crate::target::{FnResolver, Target};
     use oag_storage::open_pool;
@@ -65,5 +65,75 @@ mod tests {
 
         handle.abort();
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_request_can_travel_through_a_three_node_chain() {
+        // Node C answers; B and A only route onward.
+        let listener_c = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr_c = listener_c.local_addr().unwrap();
+        let engine_c = Arc::new(Mutex::new(Engine::new(
+            "node-c".to_string(),
+            vec![0.0; PAD_DIM],
+            vec![],
+        )));
+        let handle_c = tokio::spawn(async move {
+            serve_on(
+                engine_c,
+                listener_c,
+                Arc::new(FnResolver(|_: &Target, _: &serde_json::Value| {
+                    Some(serde_json::json!("answer-from-c"))
+                })),
+            )
+            .await
+        });
+
+        let listener_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr_b = listener_b.local_addr().unwrap();
+        let engine_b = Arc::new(Mutex::new(Engine::new(
+            "node-b".to_string(),
+            vec![1.0; PAD_DIM],
+            vec![addr_c.to_string()],
+        )));
+        let handle_b = tokio::spawn(async move {
+            serve_on(
+                engine_b,
+                listener_b,
+                Arc::new(FnResolver(|_: &Target, _: &serde_json::Value| None)),
+            )
+            .await
+        });
+
+        let listener_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr_a = listener_a.local_addr().unwrap();
+        let engine_a = Arc::new(Mutex::new(Engine::new(
+            "node-a".to_string(),
+            vec![1.0; PAD_DIM],
+            vec![addr_b.to_string()],
+        )));
+        let handle_a = tokio::spawn(async move {
+            serve_on(
+                engine_a,
+                listener_a,
+                Arc::new(FnResolver(|_: &Target, _: &serde_json::Value| None)),
+            )
+            .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let response = send(&addr_a.to_string(), &request("req-chain")).await.unwrap();
+        assert_eq!(response.answer, Some(serde_json::json!("answer-from-c")));
+        assert_eq!(response.contributions.len(), 3);
+        let node_ids: Vec<&str> = response
+            .contributions
+            .iter()
+            .map(|c| c.node_id.as_str())
+            .collect();
+        assert_eq!(node_ids, vec!["node-a", "node-b", "node-c"]);
+
+        handle_a.abort();
+        handle_b.abort();
+        handle_c.abort();
     }
 }
