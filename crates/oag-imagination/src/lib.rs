@@ -17,6 +17,7 @@
 pub mod datapad;
 pub mod engine;
 pub mod socket;
+pub mod source;
 
 pub use datapad::{
     attach, gather, reconstruct, split, split_to_pads, DataPad, DataPadError, FileManifest, Shard,
@@ -27,3 +28,4 @@ pub use engine::{
     HandleOutcome, Request, CONTRIBUTION_DOMAIN, PAD_DIM, ROUTE_DOMAIN,
 };
 pub use socket::{gather_file, read_message, send, serve, serve_on, write_message, Message, PadRequest, MAX_MESSAGE_BYTES};
+pub use source::{HardwareRandom, MixedSource, RandomSource, SoftwareRandom};

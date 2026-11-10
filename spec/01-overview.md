@@ -27,9 +27,21 @@ Three ideas:
 - **Not a trustless beacon.** The pad is a representation, not a guarantee.
 - **Not a data store for real claims.** That is `oag` and `oag-mesh`.
 
+## Randomness sources
+
+A node's contribution comes from a pluggable `RandomSource` (`source.rs`):
+
+- `SoftwareRandom` -- `oag_crypto::random_bytes_32`.
+- `MixedSource` -- with a configurable probability, returns randomness; otherwise asks a provider
+  for real data, falling back to randomness when it has none. This is the "all nodes will
+  sometimes choose to pass non random information forward" behavior.
+- `HardwareRandom` -- the seam for muon detectors, radioactive decay, atmospheric noise, etc.
+  The hardware interface is still to be figured out; the source falls back to software randomness
+  until a driver exists, and a driver replaces `next` without changing anything else.
+
 ## Open design questions
 
-- The randomness source per node is undefined. Muon detectors, answers to questions -- the
-  hardware interface is still to be figured out.
+- The hardware randomness interface is still to be figured out. Muon detectors, answers to
+  questions -- `HardwareRandom` is the seam.
 - The pad is deliberately not over-designed. The mechanisms around it change it, and the random
   chaos eventually solidifies into something real.

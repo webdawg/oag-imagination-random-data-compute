@@ -19,6 +19,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::datapad::Shard;
+use crate::source::{RandomSource, SoftwareRandom};
 
 pub const CONTRIBUTION_DOMAIN: &[u8] = b"OAG-IMAGINATION:CONTRIBUTION:v1:";
 pub const ROUTE_DOMAIN: &[u8] = b"OAG-IMAGINATION:ROUTE:v1:";
@@ -172,6 +173,9 @@ pub struct Engine {
     pub dreams: DreamLog,
     /// The data shard this node holds, if any -- the pad's data-pad role.
     pub shard: Option<Shard>,
+    /// The source of this node's contributions: software randomness, a mixed source that sometimes
+    /// passes real data, or a hardware source (muon detectors, ...).
+    pub source: Box<dyn RandomSource + Send + Sync>,
 }
 
 /// What a node did with a request.
@@ -187,7 +191,17 @@ pub enum HandleOutcome {
 
 impl Engine {
     pub fn new(node_id: String, pad: Vec<f32>, neighbors: Vec<String>) -> Self {
-        Self { node_id, pad, neighbors, dreams: DreamLog::new(), shard: None }
+        Self::with_source(node_id, pad, neighbors, Box::new(SoftwareRandom))
+    }
+
+    /// Same as `new`, with an explicit randomness source.
+    pub fn with_source(
+        node_id: String,
+        pad: Vec<f32>,
+        neighbors: Vec<String>,
+        source: Box<dyn RandomSource + Send + Sync>,
+    ) -> Self {
+        Self { node_id, pad, neighbors, dreams: DreamLog::new(), shard: None, source }
     }
 
     /// This node's data pad: its routing weights plus its shard, if it holds one.
@@ -207,7 +221,7 @@ impl Engine {
         request: &mut Request,
         resolver: impl Fn(&Request) -> Option<serde_json::Value>,
     ) -> HandleOutcome {
-        let value = oag_crypto::random_bytes_32();
+        let value = self.source.next();
         let previous = request
             .contributions
             .last()
