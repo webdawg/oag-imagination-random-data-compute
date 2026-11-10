@@ -99,4 +99,27 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    #[tokio::test]
+    async fn a_node_with_no_pad_starts_empty_and_peers_without_addresses_are_skipped() {
+        let dir = std::env::temp_dir().join(format!("oag-imagination-node-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("oag.sqlite");
+
+        let pool = open_pool(&db).await.unwrap();
+        let mut conn = pool.acquire().await.unwrap();
+        let node_id = [9u8; 32];
+        // No tensor_pads row at all.
+        // A peer with no address, and the node's own id, must both be skipped.
+        peers::upsert_peer(&mut conn, &[7u8; 32], &[3u8; 32], None, 0).await.unwrap();
+        peers::upsert_peer(&mut conn, &node_id, &[3u8; 32], None, 0).await.unwrap();
+        drop(conn);
+        drop(pool);
+
+        let adapter = NodeAdapter::load(&db, &node_id).await.unwrap();
+        assert_eq!(adapter.engine.pad, Vec::<f32>::new());
+        assert!(adapter.engine.neighbors.is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
