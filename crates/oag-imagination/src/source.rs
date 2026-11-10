@@ -66,7 +66,8 @@ where
 ///
 /// The hardware interface is still to be figured out. This is the seam: it implements
 /// `RandomSource` and falls back to software randomness until a driver exists. A driver replaces
-/// `next` with the hardware read; nothing else in the layer changes.
+/// `next` with the hardware read; nothing else in the layer changes. `DeviceRandom` below is the
+/// first real implementation of that seam -- a byte device a driver can expose.
 #[derive(Debug)]
 pub struct HardwareRandom {
     /// A label for the hardware, for logging and diagnostics. Not used by the fallback.
@@ -81,7 +82,8 @@ impl Default for HardwareRandom {
 
 impl RandomSource for HardwareRandom {
     fn next(&mut self) -> [u8; 32] {
-        // TODO: the hardware interface. Until it exists, fall back to software randomness.
+        // The hardware interface is still to be figured out; `DeviceRandom` is the byte-device
+        // implementation of this same seam. Until a driver replaces this, software randomness.
         oag_crypto::random_bytes_32()
     }
 }
@@ -169,5 +171,27 @@ mod tests {
         // A missing device falls back to software randomness rather than failing.
         let mut missing = DeviceRandom::new("/dev/definitely-not-here");
         let _ = missing.next();
+    }
+
+    #[test]
+    fn a_device_source_reads_exactly_the_device_bytes() {
+        let dir = std::env::temp_dir().join(format!("oag-imagination-hwrng-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("hwrng.bin");
+        let expected: [u8; 32] = core::array::from_fn(|i| i as u8);
+        std::fs::write(&path, expected).unwrap();
+
+        let mut source = DeviceRandom::new(&path);
+        assert_eq!(source.next(), expected);
+
+        // A device with fewer than 32 bytes is unusable, so it falls back rather than returning a
+        // short read silently.
+        std::fs::write(&path, [0u8; 4]).unwrap();
+        let mut short = DeviceRandom::new(&path);
+        let value = short.next();
+        assert_eq!(value.len(), 32);
+        assert_ne!(value, [0u8; 32]);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
