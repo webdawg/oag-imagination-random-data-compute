@@ -25,6 +25,13 @@ UDP is connectionless, so a routed request is answered by the node it reached ra
 forwarded on a connection. A deployment that needs multi-hop routing over UDP would forward the
 reply to the client itself; the carrier is for the local answer.
 
+## HTTP CONNECT tunnel (implemented)
+
+`ProxiedTransport` tunnels another carrier through an HTTP proxy: connect to the proxy, send
+`CONNECT` for the target, then run the message exchange over the tunnel. The inner carrier is
+unchanged; only the path to the target changes -- the "tunnel existing protocols" carrier. A
+real minimal proxy (CONNECT then forward) is used in the test.
+
 ## Reticulum (not yet)
 
 The same engine over a Reticulum `Link`. The base project already has a Reticulum transport
