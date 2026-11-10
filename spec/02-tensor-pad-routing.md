@@ -15,6 +15,29 @@ A request enters a node. The node:
 The request travels through 6, 10, or 50 nodes, whoever knows. The final response carries the
 whole metadata chain back.
 
+## The dream log is bounded
+
+"Saves the dream" used to mean an unbounded `Vec<Request>`: every answered request was cloned into
+a vector that nothing ever evicted. That is a memory-exhaustion vector reachable by any caller who
+can make this node *answer* a request -- which is any peer that can route one here -- and it is
+amplified per request, because a request carries caller-controlled JSON (`target`, `payload`) plus
+the whole contribution chain gathered along the route.
+
+A count cap on its own would not have been enough, and that is the important part: a single request
+may be up to the carrier's `MAX_MESSAGE_BYTES` (16 MiB over TCP), so "keep the last 1,000 dreams"
+still permits the log to reach tens of gigabytes. The log therefore enforces **both** a count cap
+(`DEFAULT_DREAM_LOG_MAX_ENTRIES`, 1,000) and a serialized-byte cap
+(`DEFAULT_DREAM_LOG_MAX_BYTES`, 8 MiB), evicting the oldest entry until both hold. An entry larger
+than the whole byte budget is not retained at all -- otherwise one request would defeat the bound.
+
+`DreamLog::with_bounds` exists so a deployment can retune the trade-off and a test can exercise
+eviction cheaply.
+
+**In-memory only, and that is a scope statement rather than an oversight.** "Recording generated
+scenarios" holds for the running process, not across restarts. Persisting the log would need its
+own decisions -- where it lives, how long it is kept, who may read it -- none of which are made
+here. The base project's tensor pad is the same shape: a value a process holds and re-learns.
+
 ## The pad
 
 The pad is a 32-element float vector -- a node's unique representation of the picture of all the

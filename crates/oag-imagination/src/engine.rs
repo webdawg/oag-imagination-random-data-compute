@@ -16,6 +16,8 @@
 //! engine over a different carrier. Not a trustless beacon: the pad is a representation, not a
 //! guarantee. Not a configured topology: the neighbors come from the layer below (`oag`).
 
+use std::collections::VecDeque;
+
 use serde::{Deserialize, Serialize};
 
 use crate::datapad::Shard;
@@ -61,23 +63,94 @@ impl Contribution {
     }
 }
 
+/// Default cap on how many answered requests the dream log keeps.
+pub const DEFAULT_DREAM_LOG_MAX_ENTRIES: usize = 1_000;
+
+/// Default cap on the dream log's total *serialized* size, across all entries.
+///
+/// A count cap alone is not enough here, and this is the number that matters: a single request can
+/// be up to the carrier's `MAX_MESSAGE_BYTES` (16 MiB over TCP), so a count-only bound would still
+/// permit the log to grow to tens of gigabytes. Both caps are enforced, and the oldest entries are
+/// evicted until both hold.
+pub const DEFAULT_DREAM_LOG_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// The serialized size of one dream, cached at record time.
+///
+/// Recomputing it on every scrape would mean re-serializing every stored request, which is the
+/// wrong cost to put on a read path that a responder may poll often.
+#[derive(Debug)]
+struct DreamEntry {
+    request: Request,
+    size: usize,
+}
+
 /// The saved dreams.
-#[derive(Debug, Default)]
+///
+/// **Bounded, deliberately.** An unbounded `Vec<Request>` is a memory-exhaustion vector reachable
+/// by any caller that can make this node *answer* a request: `handle` records every answered request
+/// as a clone, and the request carries caller-controlled JSON (`target`, `payload`) plus the whole
+/// contribution chain gathered along the route. Before this bound existed, a peer could grow the
+/// node's memory without limit -- and because a single request may be megabytes, a count cap on its
+/// own would not have been enough. Both a count cap and a serialized-byte cap are enforced, and the
+/// oldest entry is evicted when either is exceeded.
+///
+/// **In-memory only.** A restart forgets the log. That is the same posture as the base project's
+/// tensor pad being re-learned, and it is recorded rather than hidden: "recording generated
+/// scenarios" is satisfied for the running process, not across restarts. Persisting it would need
+/// its own storage decision (where, how long, who may read it), which is not made here.
+#[derive(Debug)]
 pub struct DreamLog {
-    dreams: Vec<Request>,
+    dreams: VecDeque<DreamEntry>,
+    max_entries: usize,
+    max_bytes: usize,
+    current_bytes: usize,
+}
+
+impl Default for DreamLog {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DreamLog {
     pub fn new() -> Self {
-        Self::default()
+        Self::with_bounds(DEFAULT_DREAM_LOG_MAX_ENTRIES, DEFAULT_DREAM_LOG_MAX_BYTES)
+    }
+
+    /// A log with explicit bounds, for a deployment that wants a different trade-off or a test
+    /// that wants to exercise eviction cheaply.
+    pub fn with_bounds(max_entries: usize, max_bytes: usize) -> Self {
+        Self {
+            dreams: VecDeque::new(),
+            max_entries,
+            max_bytes,
+            current_bytes: 0,
+        }
     }
 
     pub fn record(&mut self, dream: Request) {
-        self.dreams.push(dream);
+        let size = serde_json::to_vec(&dream).map(|v| v.len()).unwrap_or(0);
+        self.current_bytes += size;
+        self.dreams.push_back(DreamEntry { request: dream, size });
+        self.evict();
     }
 
-    pub fn dreams(&self) -> &[Request] {
-        &self.dreams
+    /// Drops the oldest entries until both caps hold.
+    fn evict(&mut self) {
+        while self.current_bytes > self.max_bytes || self.dreams.len() > self.max_entries {
+            let Some(oldest) = self.dreams.pop_front() else { break };
+            self.current_bytes -= oldest.size;
+        }
+    }
+
+    /// Every stored dream, oldest first.
+    pub fn dreams(&self) -> impl Iterator<Item = &Request> {
+        self.dreams.iter().map(|entry| &entry.request)
+    }
+
+    /// Total serialized bytes currently retained -- the other half of the bound.
+    pub fn bytes(&self) -> usize {
+        self.current_bytes
     }
 
     pub fn len(&self) -> usize {
@@ -91,7 +164,11 @@ impl DreamLog {
     /// Every dream whose request target matches `target` -- a responder (or an
     /// operator) asking "what has this node been asked for".
     pub fn for_target(&self, target: &serde_json::Value) -> Vec<&Request> {
-        self.dreams.iter().filter(|d| d.target == *target).collect()
+        self.dreams
+            .iter()
+            .map(|entry| &entry.request)
+            .filter(|d| d.target == *target)
+            .collect()
     }
 
     /// Every dream whose chain includes `node_id` -- "what has this node
@@ -99,13 +176,14 @@ impl DreamLog {
     pub fn for_node(&self, node_id: &str) -> Vec<&Request> {
         self.dreams
             .iter()
+            .map(|entry| &entry.request)
             .filter(|d| d.contributions.iter().any(|c| c.node_id == node_id))
             .collect()
     }
 
     /// The most recent dream, if any.
     pub fn last(&self) -> Option<&Request> {
-        self.dreams.last()
+        self.dreams.back().map(|entry| &entry.request)
     }
 }
 
@@ -286,6 +364,69 @@ mod tests {
             contributions: vec![],
             answer: None,
         }
+    }
+
+    /// The defect this guards: `DreamLog` was an unbounded `Vec<Request>`, and `handle` records
+    /// every answered request as a clone. Any caller who can make this node answer a request --
+    /// which is any peer that can route one here -- could grow its memory without limit, and
+    /// because a request carries caller-controlled JSON the growth was amplified per request.
+    #[tokio::test]
+    async fn the_dream_log_evicts_the_oldest_entry_past_its_count_cap() {
+        let mut engine = Engine::new(
+            "node-a".to_string(),
+            vec![1.0; PAD_DIM],
+            vec![],
+        );
+        engine.dreams = DreamLog::with_bounds(2, DEFAULT_DREAM_LOG_MAX_BYTES);
+        let mut resolver = LocalResolver::new();
+        resolver.insert("target", serde_json::json!("answer"));
+
+        for id in ["req-1", "req-2", "req-3"] {
+            let mut request = request(id);
+            engine.handle(&mut request, &resolver).await;
+        }
+
+        assert_eq!(engine.dreams.len(), 2, "the count cap must hold");
+        // Oldest first, so the two survivors are the two most recent.
+        let ids: Vec<&str> = engine.dreams.dreams().map(|d| d.id.as_str()).collect();
+        assert_eq!(ids, vec!["req-2", "req-3"]);
+        assert_eq!(engine.dreams.last().unwrap().id, "req-3");
+    }
+
+    /// A count cap alone is not enough: one request may be megabytes (`MAX_MESSAGE_BYTES` is 16 MiB
+    /// over TCP), so the byte cap is the one that actually bounds memory. With a tiny byte cap and
+    /// a large payload, the log must evict rather than retain.
+    #[tokio::test]
+    async fn the_dream_log_evicts_past_its_byte_cap() {
+        let mut engine = Engine::new("node-a".to_string(), vec![1.0; PAD_DIM], vec![]);
+        engine.dreams = DreamLog::with_bounds(DEFAULT_DREAM_LOG_MAX_ENTRIES, 64);
+        let mut resolver = LocalResolver::new();
+        resolver.insert("target", serde_json::json!("answer"));
+
+        for i in 0..5 {
+            let mut request = request(&format!("req-{i}"));
+            request.payload = serde_json::json!("x".repeat(256));
+            engine.handle(&mut request, &resolver).await;
+        }
+
+        assert!(engine.dreams.bytes() <= 64, "the byte cap must hold, got {}", engine.dreams.bytes());
+        assert!(engine.dreams.len() < 5, "oversized entries must have been evicted");
+    }
+
+    /// One entry larger than the whole budget must not be retained: otherwise a single request
+    /// would defeat the bound entirely.
+    #[tokio::test]
+    async fn a_single_entry_larger_than_the_budget_is_not_retained() {
+        let mut engine = Engine::new("node-a".to_string(), vec![1.0; PAD_DIM], vec![]);
+        engine.dreams = DreamLog::with_bounds(DEFAULT_DREAM_LOG_MAX_ENTRIES, 8);
+        let mut resolver = LocalResolver::new();
+        resolver.insert("target", serde_json::json!("answer"));
+
+        let mut request = request("req-big");
+        request.payload = serde_json::json!("x".repeat(1024));
+        engine.handle(&mut request, &resolver).await;
+
+        assert!(engine.dreams.is_empty(), "an entry larger than the budget must be evicted, got {} bytes", engine.dreams.bytes());
     }
 
     #[tokio::test]
