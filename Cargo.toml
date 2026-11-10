@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/oag-imagination",
+    "crates/oag-imagination-reticulum",
 ]
 
 [workspace.package]
@@ -18,6 +19,8 @@ oag-crypto = { git = "https://github.com/webdawg/open-agent-graph.git", branch =
 # The layer below: the imagination layer reads the tensor pads and peers from `oag`'s storage
 # rather than keeping its own copy -- a layer-up protocol connects through the layer below.
 oag-storage = { git = "https://github.com/webdawg/open-agent-graph.git", branch = "main" }
+# The layer this adapter plugs into.
+oag-imagination = { path = "crates/oag-imagination" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -26,3 +29,8 @@ hex = "0.4"
 blake3 = "1"
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "multipart", "rustls"] }
+tracing = "0.1"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+chacha20poly1305 = "0.10"
+axum = "0.8"
+

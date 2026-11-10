@@ -41,8 +41,9 @@ back.
 Carriers are the same engine over a different transport (`socket::Transport`): TCP, UDP, HTTP
 (`HttpTransport`), an HTTP `CONNECT` tunnel (`ProxiedTransport`), and IPFS in both directions
 (`IpfsTransport` reads by CID, `PublishingIpfsTransport` publishes and returns the CID). A
-Reticulum carrier is a seam (`ReticulumCarrier`) -- the base project's `oag-reticulum` transport
-adapts to it, so this layer does not depend on the Reticulum crate. No carrier is configured:
+Reticulum is implemented in a separate crate, `oag-imagination-reticulum`, which fills the
+`ReticulumCarrier` seam with a real Reticulum `Link` -- so this layer still does not depend on the
+Reticulum crate, and a node running over TCP or HTTP never pays for it. No carrier is configured:
 the node reads its pad and peers from `oag`'s own database.
 
 The founding statements are recorded verbatim in `USER_INPUT_RECORD.md`.

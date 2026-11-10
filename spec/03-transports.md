@@ -4,13 +4,33 @@
 
 The engine is transport-agnostic. This file lists the carriers.
 
-## Reticulum (seam only)
+## Reticulum (implemented, in a separate crate)
 
-`ReticulumCarrier` is the seam for the Reticulum carrier: the base project's Reticulum
-transport (`oag-reticulum`) adapts to it, and the imagination layer does not depend on the
-Reticulum crate. The adapter is the same transport with a different handler. A carrier only
-moves a message to a destination and returns the reply; the routing logic stays in the
-engine.
+**Source**: `crates/oag-imagination-reticulum/src/lib.rs`.
+
+`ReticulumCarrier` was the seam; `oag-imagination-reticulum` is the adapter that fills it. The
+imagination *layer* still has no dependency on the `reticulum` crate -- the adapter is a separate
+crate, so a node running over TCP, HTTP, or IPFS never pays for this one.
+
+- `ReticulumTransport::connect(uplink_tcp, identity_seed)` -- the client half. Implements both
+  `ReticulumCarrier` (the Option-returning seam) and `Transport` (so `send_with` works), moving
+  one `Message` to a destination address and returning the reply. `with_announce_wait` overrides
+  how long a send waits for the destination's announce.
+- `serve(engine, resolver, identity_seed, listen_tcp)` -- the server half. Announces
+  `("oag-imagination", "engine")` and answers requests through the engine, mirroring
+  `socket::serve_on`. Announces every 5s so a client that subscribes between announcements does
+  not wait a full interval.
+- Framing is a 4-byte big-endian length prefix over the JSON body, split into 1400-byte chunks --
+  deliberately the same wire format as the base project's own Reticulum transport.
+
+**Identity.** The base project derives its Reticulum identity from the peer's Ed25519 signing key.
+This crate has no `oag-crypto` dependency, so it takes a seed *string* and derives deterministically
+via `PrivateIdentity::new_from_name`. The seed must be stable across restarts or the node's address
+changes and its peers can no longer reach it.
+
+**Failure posture.** A send that cannot complete -- no announce, link not activated, no reply --
+returns `None` (or an `io::Error` through `Transport`) rather than panicking or hanging past its
+timeout. This is the same "degrade, don't drop" rule the other carriers follow.
 
 ## TCP (implemented)
 
@@ -59,11 +79,17 @@ IPFS HTTP gateway.
 `ProxiedTransport` (above) is the tunnel carrier. There is no separate "tunnels" carrier
 beyond it.
 
-## Reticulum (not yet)
+## Reticulum tests
 
-The same engine over a Reticulum `Link`. The base project already has a Reticulum transport
-(`oag-reticulum`); the imagination engine uses the same carrier. `ReticulumCarrier` is the seam
-and the adapter is not written.
+`crates/oag-imagination-reticulum/tests/loopback.rs` drives a real `TcpServer`/`TcpClient` pair on
+loopback -- no graph, no TCP engine carrier, no public Reticulum network:
+
+- `a_request_travels_over_a_real_reticulum_link` -- a real request reaches a real `serve`
+  instance over a real `Link`, is answered by the engine's resolver, and the reply carries the
+  server node's contribution.
+- `a_send_to_an_unknown_destination_fails_softly` -- no server is listening, so no announce can
+  ever arrive; the send must return `None` at its own timeout rather than hanging.
+- `a_bad_destination_address_is_a_clean_error` -- a malformed address hash fails softly too.
 
 ## The carrier trait
 
@@ -72,7 +98,10 @@ reply`. `TcpTransport` implements it; a test in `socket.rs` implements it in mem
 tunnel, and IPFS carriers implement the same trait -- a carrier only moves a message and returns
 the reply; the routing logic is the engine's, not the carrier's. `send_with` and
 `gather_file_with` take an explicit carrier. `ReticulumCarrier` is a second, Option-returning
-seam for the one carrier whose transport has no built-in implementation yet.
+seam, kept separate from `Transport` because a Reticulum send fails in ways a TCP send does not
+(no announce, link not activated) and the caller should see that as "no answer" rather than as an
+I/O error. `ReticulumTransport` implements both, mapping `None` to an `io::Error` for the
+`Transport` half.
 
 ## What this explicitly is not
 
