@@ -38,6 +38,6 @@ pub use node::{NodeAdapter, NodeError};
 pub use source::{DeviceRandom, HardwareRandom, MixedSource, RandomSource, SoftwareRandom};
 pub use target::{
     CidFetcher, CidResolver, CompositeResolver, FnResolver, HttpGatewayFetcher, HttpPeerFetcher,
-    LocalResolver, PeerFetcher, PeerResolver, Resolver, StoreResolver, Target,
+    LocalResolver, PeerFetcher, PeerResolver, Resolver, StoreResolver, Target, UrlResolver,
     TRANSFER_REQUEST_DOMAIN,
 };

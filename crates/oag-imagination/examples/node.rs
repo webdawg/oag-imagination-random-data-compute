@@ -5,15 +5,20 @@
 //! ```
 //!
 //! The adapter reads the node's tensor pad and peer list from the `oag` database; the
-//! engine serves imagination requests over TCP. A node with no pad yet starts empty, and
-//! the peers come from `oag`'s own `peers`/`peer_addresses` tables -- nothing is configured
-//! here.
+//! engine serves imagination requests over TCP. The resolver is a composite: a local
+//! map, a store (reads and writes), a URL fetch, a CID fetch through an IPFS gateway, and
+//! a peer fetch through `oag`'s transfer protocol. Nothing is configured here -- the
+//! adapter reads the layer below, and the composite is assembled from the resolvers the
+//! node happens to have.
 
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
-use oag_imagination::{socket, CompositeResolver, LocalResolver, NodeAdapter};
+use oag_imagination::{
+    socket, CompositeResolver, CidResolver, HttpGatewayFetcher, HttpPeerFetcher, LocalResolver,
+    NodeAdapter, PeerResolver, StoreResolver, UrlResolver,
+};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -30,15 +35,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let neighbor_count = adapter.engine.neighbors.len();
     let engine = Arc::new(Mutex::new(adapter.engine));
 
+    // The composite: try the local map, then the store, then a URL, a CID, and a peer.
     let mut resolver = CompositeResolver::new();
     resolver.add(Box::new(LocalResolver::new()));
+    resolver.add(Box::new(StoreResolver::new()));
+    resolver.add(Box::new(UrlResolver::new()));
+    resolver.add(Box::new(CidResolver::new(HttpGatewayFetcher::new("https://ipfs.io"))));
+    resolver.add(Box::new(PeerResolver::new(HttpPeerFetcher::new(
+        oag_crypto::PeerIdentity::generate(),
+    ))));
     let resolver = Arc::new(resolver);
 
     eprintln!(
         "oag-imagination: node {} listening on {} ({} neighbor(s))",
-        node_id,
-        listen,
-        neighbor_count
+        node_id, listen, neighbor_count
     );
     socket::serve(engine, &listen, resolver).await?;
     Ok(())
