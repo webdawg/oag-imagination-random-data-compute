@@ -197,6 +197,22 @@ impl<F: crate::target::CidFetcher> Transport for IpfsTransport<F> {
     }
 }
 
+/// A seam for a Reticulum carrier. The base project's Reticulum transport
+/// (`oag-reticulum`) adapts to this trait; the imagination layer does not depend on the
+/// Reticulum crate. A carrier only moves a message to a destination and returns the reply
+/// -- the routing logic is the engine's, not the carrier's.
+///
+/// The base project's Reticulum transport carries `oag/sync`'s hello/events/peers calls
+/// today; the adapter for this trait is the same transport with a different handler, which
+/// is why the seam exists here rather than a Reticulum-specific carrier.
+pub trait ReticulumCarrier: Send + Sync {
+    fn send<'a>(
+        &'a self,
+        destination: &'a str,
+        message: &'a Message,
+    ) -> Pin<Box<dyn Future<Output = Option<Message>> + Send + 'a>>;
+}
+
 /// The UDP carrier: one datagram in, one datagram out. UDP is connectionless, so a routed
 /// request is answered by the node it reached rather than forwarded on a connection -- the
 /// carrier is for the local answer, and a deployment that needs multi-hop routing over UDP

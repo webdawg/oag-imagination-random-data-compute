@@ -4,6 +4,14 @@
 
 The engine is transport-agnostic. This file lists the carriers.
 
+## Reticulum (seam only)
+
+`ReticulumCarrier` is the seam for the Reticulum carrier: the base project's Reticulum
+transport (`oag-reticulum`) adapts to it, and the imagination layer does not depend on the
+Reticulum crate. The adapter is the same transport with a different handler. A carrier only
+moves a message to a destination and returns the reply; the routing logic stays in the
+engine.
+
 ## TCP (implemented)
 
 A thin length-prefixed JSON protocol over TCP. A message is either an imagination `Request` (the
