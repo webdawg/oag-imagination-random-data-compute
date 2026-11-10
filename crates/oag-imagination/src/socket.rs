@@ -109,6 +109,43 @@ pub async fn send_with(
     }
 }
 
+/// A carrier that retrieves a message from IPFS by CID: the address is the CID, and the
+/// message published at that CID is the response. Uses the same `CidFetcher` seam as
+/// `CidResolver`, so the base project's `PinningProvider` plugs in without the IPFS crate.
+pub struct IpfsTransport<F: crate::target::CidFetcher> {
+    fetcher: F,
+}
+
+impl<F: crate::target::CidFetcher> IpfsTransport<F> {
+    pub fn new(fetcher: F) -> Self {
+        Self { fetcher }
+    }
+}
+
+impl<F: crate::target::CidFetcher> std::fmt::Debug for IpfsTransport<F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IpfsTransport").finish()
+    }
+}
+
+impl<F: crate::target::CidFetcher> Transport for IpfsTransport<F> {
+    fn send<'a>(
+        &'a self,
+        address: &'a str,
+        _message: &'a Message,
+    ) -> Pin<Box<dyn Future<Output = std::io::Result<Message>> + Send + 'a>> {
+        Box::pin(async move {
+            let bytes = self
+                .fetcher
+                .fetch(address)
+                .await
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "CID not found"))?;
+            serde_json::from_slice(&bytes)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        })
+    }
+}
+
 /// The UDP carrier: one datagram in, one datagram out. UDP is connectionless, so a routed
 /// request is answered by the node it reached rather than forwarded on a connection -- the
 /// carrier is for the local answer, and a deployment that needs multi-hop routing over UDP
@@ -265,7 +302,9 @@ mod tests {
     use super::*;
     use crate::datapad::split_to_pads;
     use crate::engine::{Engine, PAD_DIM, Request};
-    use crate::target::{FnResolver, Target};
+    use crate::target::{CidFetcher, FnResolver, Target};
+    use std::future::Future;
+    use std::pin::Pin;
     use tokio::net::UdpSocket;
     use std::sync::Arc;
     use tokio::sync::Mutex;
@@ -348,6 +387,58 @@ mod tests {
 
         handle_a.abort();
         handle_b.abort();
+    }
+
+    #[tokio::test]
+    async fn a_message_is_retrieved_from_ipfs_by_cid() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        // A minimal IPFS gateway serving the published message at /ipfs/<cid>.
+        let published = Message::Request(request("req-ipfs"));
+        let body = serde_json::to_vec(&published).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.write_all(&body).await;
+        });
+
+        #[derive(Debug)]
+        struct GatewayFetcher {
+            gateway: String,
+        }
+
+        impl CidFetcher for GatewayFetcher {
+            fn fetch<'a>(
+                &'a self,
+                cid: &'a str,
+            ) -> Pin<Box<dyn Future<Output = Option<Vec<u8>>> + Send + 'a>> {
+                Box::pin(async move {
+                    let url = format!("{}/ipfs/{}", self.gateway, cid);
+                    let response = reqwest::get(url).await.ok()?;
+                    if !response.status().is_success() {
+                        return None;
+                    }
+                    Some(response.bytes().await.ok()?.to_vec())
+                })
+            }
+        }
+
+        let transport = IpfsTransport::new(GatewayFetcher { gateway: format!("http://{addr}") });
+        let fetched = transport.send("QmPublished", &published).await.unwrap();
+        let Message::Request(request) = fetched else {
+            panic!("expected a request message");
+        };
+        assert_eq!(request.id, "req-ipfs");
+        handle.await.unwrap();
     }
 
     #[tokio::test]
