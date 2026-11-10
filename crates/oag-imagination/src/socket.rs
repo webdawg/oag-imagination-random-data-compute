@@ -9,6 +9,8 @@
 //! request carries the whole metadata chain back, so a client that connects to any node gets the
 //! answer plus every contribution along the path.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -55,11 +57,49 @@ pub async fn write_message(stream: &mut TcpStream, message: &Message) -> std::io
     Ok(())
 }
 
-/// Sends a request to a node and returns its response -- the answer plus the metadata chain.
+/// A carrier for the engine's messages. The engine is transport-agnostic: TCP is implemented,
+/// and Reticulum, IPFS, and tunnels implement this same trait. A carrier only has to move a
+/// message to an address and return the reply -- the routing logic is the engine's, not the
+/// carrier's.
+pub trait Transport: Send + Sync {
+    fn send<'a>(
+        &'a self,
+        address: &'a str,
+        message: &'a Message,
+    ) -> Pin<Box<dyn Future<Output = std::io::Result<Message>> + Send + 'a>>;
+}
+
+/// The TCP carrier: a length-prefixed JSON message over a TCP stream.
+#[derive(Debug, Default)]
+pub struct TcpTransport;
+
+impl Transport for TcpTransport {
+    fn send<'a>(
+        &'a self,
+        address: &'a str,
+        message: &'a Message,
+    ) -> Pin<Box<dyn Future<Output = std::io::Result<Message>> + Send + 'a>> {
+        Box::pin(async move {
+            let mut stream = TcpStream::connect(address).await?;
+            write_message(&mut stream, message).await?;
+            read_message(&mut stream).await
+        })
+    }
+}
+
+/// Sends a request to a node over the TCP carrier and returns its response -- the answer plus the
+/// metadata chain.
 pub async fn send(address: &str, request: &Request) -> std::io::Result<Request> {
-    let mut stream = TcpStream::connect(address).await?;
-    write_message(&mut stream, &Message::Request(request.clone())).await?;
-    match read_message(&mut stream).await? {
+    send_with(&TcpTransport, address, request).await
+}
+
+/// Same as `send`, over an explicit carrier -- the seam Reticulum, IPFS, and tunnels plug into.
+pub async fn send_with(
+    transport: &dyn Transport,
+    address: &str,
+    request: &Request,
+) -> std::io::Result<Request> {
+    match transport.send(address, &Message::Request(request.clone())).await? {
         Message::Request(response) => Ok(response),
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -130,18 +170,24 @@ where
     }
 }
 
-/// Gathers a file's shards from the given nodes and reconstructs it. Each node is asked for its
-/// data pad; the shards are collected in manifest order and reconstructed.
+/// Gathers a file's shards from the given nodes over the TCP carrier and reconstructs it.
 pub async fn gather_file(manifest: &FileManifest, nodes: &[String]) -> Result<Vec<u8>, DataPadError> {
+    gather_file_with(&TcpTransport, manifest, nodes).await
+}
+
+/// Same as `gather_file`, over an explicit carrier.
+pub async fn gather_file_with(
+    transport: &dyn Transport,
+    manifest: &FileManifest,
+    nodes: &[String],
+) -> Result<Vec<u8>, DataPadError> {
     let mut pads = Vec::new();
     for node in nodes {
-        let mut stream = TcpStream::connect(node)
-            .await
-            .map_err(|_| DataPadError::NodeUnreachable(node.clone()))?;
-        write_message(&mut stream, &Message::PadRequest(PadRequest { pad_id: String::new() }))
+        let response = transport
+            .send(node, &Message::PadRequest(PadRequest { pad_id: String::new() }))
             .await
             .map_err(|e| DataPadError::Transport(e.to_string()))?;
-        match read_message(&mut stream).await.map_err(|e| DataPadError::Transport(e.to_string()))? {
+        match response {
             Message::PadResponse(pad) => pads.push(pad),
             _ => return Err(DataPadError::NotAPad),
         }
@@ -225,6 +271,36 @@ mod tests {
 
         handle_a.abort();
         handle_b.abort();
+    }
+
+    #[tokio::test]
+    async fn a_custom_carrier_can_carry_a_request() {
+        use std::future::Future;
+        use std::pin::Pin;
+
+        struct InMemory;
+
+        impl Transport for InMemory {
+            fn send<'a>(
+                &'a self,
+                _address: &'a str,
+                message: &'a Message,
+            ) -> Pin<Box<dyn Future<Output = std::io::Result<Message>> + Send + 'a>> {
+                Box::pin(async move {
+                    match message {
+                        Message::Request(request) => {
+                            let mut response = request.clone();
+                            response.answer = Some(serde_json::json!("in-memory"));
+                            Ok(Message::Request(response))
+                        }
+                        other => Ok(other.clone()),
+                    }
+                })
+            }
+        }
+
+        let response = send_with(&InMemory, "any-address", &request("req-in-memory")).await.unwrap();
+        assert_eq!(response.answer, Some(serde_json::json!("in-memory")));
     }
 
     #[tokio::test]

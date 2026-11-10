@@ -28,6 +28,14 @@ The same engine over IPFS. A request can be a CID; the engine routes it over IPF
 
 The same engine tunneling existing protocols.
 
+## The carrier trait
+
+`socket::Transport` is the seam: `fn send(&self, address, message) -> a future returning the
+reply`. `TcpTransport` implements it; a test in `socket.rs` implements it in memory. Reticulum,
+IPFS, and tunnels implement the same trait -- a carrier only moves a message and returns the
+reply; the routing logic is the engine's, not the carrier's. `send_with` and `gather_file_with`
+take an explicit carrier.
+
 ## What this explicitly is not
 
 - **Not a new application protocol.** The engine is the same over every carrier.

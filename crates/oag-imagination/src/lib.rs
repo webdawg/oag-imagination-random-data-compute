@@ -28,6 +28,9 @@ pub use engine::{
     chain_contribution, combine_pads, reinforce, route, Contribution, DreamLog, Engine, EngineError,
     HandleOutcome, Request, CONTRIBUTION_DOMAIN, PAD_DIM, ROUTE_DOMAIN,
 };
-pub use socket::{gather_file, read_message, send, serve, serve_on, write_message, Message, PadRequest, MAX_MESSAGE_BYTES};
+pub use socket::{
+    gather_file, gather_file_with, read_message, send, send_with, serve, serve_on, write_message,
+    Message, PadRequest, TcpTransport, Transport, MAX_MESSAGE_BYTES,
+};
 pub use node::{NodeAdapter, NodeError};
 pub use source::{HardwareRandom, MixedSource, RandomSource, SoftwareRandom};
