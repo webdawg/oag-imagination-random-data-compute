@@ -16,6 +16,7 @@
 
 pub mod datapad;
 pub mod engine;
+pub mod integration;
 pub mod node;
 pub mod socket;
 pub mod source;
