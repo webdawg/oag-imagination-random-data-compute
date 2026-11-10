@@ -64,6 +64,19 @@ impl Contribution {
 }
 
 /// Default cap on how many answered requests the dream log keeps.
+/// Cap on how many hops a single request may travel.
+///
+/// The engine has no visited-set: the pad picks the next hop by weight, and a cycle between two
+/// nodes is a possible outcome rather than an impossible one. Without a hop budget such a request
+/// would accumulate one contribution per hop and be re-sent in full at each, amplifying bandwidth
+/// and memory until the carrier's `MAX_MESSAGE_BYTES` happened to reject it -- a bound, but an
+/// accidental one measured in megabytes of waste per cycle.
+///
+/// 64 is well above the design intent in `spec/02` ("travels through 6, 10, or 50 nodes") and
+/// matches the spirit of the base project's `relay_hops_remaining`, which bounds the same shape of
+/// amplification on the relay path.
+pub const MAX_ROUTE_HOPS: usize = 64;
+
 pub const DEFAULT_DREAM_LOG_MAX_ENTRIES: usize = 1_000;
 
 /// Default cap on the dream log's total *serialized* size, across all entries.
@@ -286,6 +299,9 @@ pub enum HandleOutcome {
     RouteTo(String),
     /// The node had nowhere to route it.
     NoRoute,
+    /// The node could not answer and the request had already travelled [`MAX_ROUTE_HOPS`] hops, so
+    /// forwarding it further was refused rather than allowed to amplify.
+    TooManyHops,
 }
 
 impl Engine {
@@ -339,6 +355,13 @@ impl Engine {
             .last()
             .map(|c| c.chain_value().unwrap_or_else(|_| genesis_previous()))
             .unwrap_or_else(genesis_previous);
+        // Stop forwarding a request that has already travelled the budget. Checked *after* the
+        // resolver attempt: a node that can answer should answer regardless of how long the chain
+        // behind it is.
+        if request.contributions.len() >= MAX_ROUTE_HOPS {
+            return HandleOutcome::TooManyHops;
+        }
+
         match route(&self.pad, &self.neighbors, &seed) {
             Some(next) => {
                 if let Some(index) = self.neighbors.iter().position(|n| n == &next) {
@@ -445,6 +468,70 @@ mod tests {
         assert_eq!(engine.dreams.for_target(&target).len(), 1);
         assert_eq!(engine.dreams.for_node("node-a").len(), 2);
         assert_eq!(engine.dreams.last().unwrap().id, "req-q2");
+    }
+
+    /// The hop budget is what stops a cycling request from amplifying: the engine has no
+    /// visited-set, so a cycle between two pads is a possible routing outcome, and without this
+    /// cap such a request would grow one contribution per hop and be re-sent in full each time
+    /// until the carrier's message-size limit happened to reject it.
+    #[tokio::test]
+    async fn a_request_at_the_hop_budget_is_not_forwarded() {
+        let mut engine = Engine::new(
+            "node-a".to_string(),
+            vec![1.0; PAD_DIM],
+            vec!["node-b".to_string()],
+        );
+        // A resolver that can never answer, so the only paths are forwarding and giving up.
+        let resolver = LocalResolver::new();
+
+        // The chain length is checked *after* this node adds its own contribution, so a node
+        // forwards only while the chain it would pass on is still under the budget.
+        let contributions = |n: usize| (0..n).map(|i| Contribution {
+            node_id: format!("prev-{i}"),
+            value: "00".to_string(),
+            previous: "00".to_string(),
+        }).collect::<Vec<_>>();
+
+        // Two below the budget: this node's contribution makes it MAX-1, so it still routes.
+        let mut near_limit = request("req-near-limit");
+        near_limit.contributions = contributions(MAX_ROUTE_HOPS - 2);
+        assert!(matches!(
+            engine.handle(&mut near_limit, &resolver).await,
+            HandleOutcome::RouteTo(_)
+        ));
+        assert_eq!(near_limit.contributions.len(), MAX_ROUTE_HOPS - 1);
+
+        // One below the budget: this node's contribution reaches MAX, so forwarding is refused.
+        let mut at_limit = request("req-at-limit");
+        at_limit.contributions = contributions(MAX_ROUTE_HOPS - 1);
+        assert_eq!(
+            engine.handle(&mut at_limit, &resolver).await,
+            HandleOutcome::TooManyHops
+        );
+        // The refusal still added this node's own contribution -- the bound is on forwarding, not
+        // on recording that this node took part.
+        assert_eq!(at_limit.contributions.len(), MAX_ROUTE_HOPS);
+    }
+
+    /// The budget bounds forwarding, not answering: a node that can answer should answer however
+    /// long the chain behind the request is.
+    #[tokio::test]
+    async fn the_hop_budget_does_not_stop_a_node_that_can_answer() {
+        let mut engine = Engine::new("node-a".to_string(), vec![1.0; PAD_DIM], vec![]);
+        let mut resolver = LocalResolver::new();
+        resolver.insert("target", serde_json::json!("answer"));
+
+        let mut request = request("req-long-chain");
+        request.contributions = (0..MAX_ROUTE_HOPS + 500)
+            .map(|i| Contribution {
+                node_id: format!("prev-{i}"),
+                value: "00".to_string(),
+                previous: "00".to_string(),
+            })
+            .collect();
+
+        assert_eq!(engine.handle(&mut request, &resolver).await, HandleOutcome::Answered);
+        assert_eq!(request.answer, Some(serde_json::json!("answer")));
     }
 
     #[tokio::test]

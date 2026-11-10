@@ -15,6 +15,24 @@ A request enters a node. The node:
 The request travels through 6, 10, or 50 nodes, whoever knows. The final response carries the
 whole metadata chain back.
 
+## A request may travel at most `MAX_ROUTE_HOPS` hops
+
+The engine has no visited-set: the pad picks the next hop by weight, so a cycle between two nodes
+is a possible routing outcome rather than an impossible one. Without a hop budget such a request
+would accumulate one contribution per hop and be re-sent in full each time, amplifying bandwidth and
+memory until the carrier's `MAX_MESSAGE_BYTES` happened to reject it -- a bound, but an accidental
+one measured in megabytes of waste per cycle.
+
+`MAX_ROUTE_HOPS` (64) is well above this file's own "6, 10, or 50 nodes" design intent and matches
+the spirit of the base project's `relay_hops_remaining`, which bounds the same shape of
+amplification on the relay path. A node that has exhausted the budget returns `TooManyHops` instead
+of forwarding; it still records its own contribution, because the bound is on forwarding, not on
+the node acknowledging that it took part.
+
+**The budget bounds forwarding, not answering.** A node that can answer does so however long the
+chain behind the request is -- the answer is the whole point, and refusing it would turn a
+bounded-chain problem into a failed request.
+
 ## The dream log is bounded
 
 "Saves the dream" used to mean an unbounded `Vec<Request>`: every answered request was cloned into
