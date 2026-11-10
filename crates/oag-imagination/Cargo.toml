@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 oag-core.workspace = true
 oag-crypto.workspace = true
+oag-storage.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

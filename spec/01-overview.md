@@ -27,6 +27,16 @@ Three ideas:
 - **Not a trustless beacon.** The pad is a representation, not a guarantee.
 - **Not a data store for real claims.** That is `oag` and `oag-mesh`.
 
+## Wiring into `oag`
+
+The layer does not keep its own copy of the pad or the peer list. `node::NodeAdapter` reads the
+node's pad from the `tensor_pads` table and its neighbors from the `peers` and `peer_addresses`
+tables -- the layer below -- and builds the engine from what it finds. A node with no pad yet gets
+an empty one, matching the base project's own default.
+
+The adapter only reads. It does not update the pad or the peer list; the base project's own
+writers (`oag-sync`, `oag-brain`) remain the only writers.
+
 ## Randomness sources
 
 A node's contribution comes from a pluggable `RandomSource` (`source.rs`):

@@ -16,6 +16,7 @@
 
 pub mod datapad;
 pub mod engine;
+pub mod node;
 pub mod socket;
 pub mod source;
 
@@ -28,4 +29,5 @@ pub use engine::{
     HandleOutcome, Request, CONTRIBUTION_DOMAIN, PAD_DIM, ROUTE_DOMAIN,
 };
 pub use socket::{gather_file, read_message, send, serve, serve_on, write_message, Message, PadRequest, MAX_MESSAGE_BYTES};
+pub use node::{NodeAdapter, NodeError};
 pub use source::{HardwareRandom, MixedSource, RandomSource, SoftwareRandom};
