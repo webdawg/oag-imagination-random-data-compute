@@ -15,6 +15,16 @@ routing engine) or a `PadRequest`/`PadResponse` pair (the data-pad gathering pat
 - `socket::gather_file` -- ask each node for its pad, gather the shards in manifest order, and
   reconstruct the file. A missing pad is an error, not a guess.
 
+## UDP (implemented)
+
+A second socket carrier: one datagram in, one datagram out. `UdpTransport` (client) and
+`serve_udp` / `serve_udp_on` (server). Datagrams are capped at the UDP payload limit
+(`MAX_DATAGRAM_BYTES`); a larger message is an error rather than a silent truncation.
+
+UDP is connectionless, so a routed request is answered by the node it reached rather than
+forwarded on a connection. A deployment that needs multi-hop routing over UDP would forward the
+reply to the client itself; the carrier is for the local answer.
+
 ## Reticulum (not yet)
 
 The same engine over a Reticulum `Link`. The base project already has a Reticulum transport

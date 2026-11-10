@@ -30,8 +30,9 @@ pub use engine::{
     HandleOutcome, Request, CONTRIBUTION_DOMAIN, PAD_DIM, ROUTE_DOMAIN,
 };
 pub use socket::{
-    gather_file, gather_file_with, read_message, send, send_with, serve, serve_on, write_message,
-    Message, PadRequest, TcpTransport, Transport, MAX_MESSAGE_BYTES,
+    gather_file, gather_file_with, read_message, send, send_with, serve, serve_on, serve_udp,
+    serve_udp_on, write_message, Message, PadRequest, TcpTransport, Transport, UdpTransport,
+    MAX_DATAGRAM_BYTES, MAX_MESSAGE_BYTES,
 };
 pub use node::{NodeAdapter, NodeError};
 pub use source::{HardwareRandom, MixedSource, RandomSource, SoftwareRandom};

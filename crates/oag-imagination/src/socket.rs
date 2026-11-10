@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::Mutex;
 
 use crate::datapad::{self, DataPad, DataPadError, FileManifest};
@@ -106,6 +106,72 @@ pub async fn send_with(
             std::io::ErrorKind::InvalidData,
             "expected a request response",
         )),
+    }
+}
+
+/// The UDP carrier: one datagram in, one datagram out. UDP is connectionless, so a routed
+/// request is answered by the node it reached rather than forwarded on a connection -- the
+/// carrier is for the local answer, and a deployment that needs multi-hop routing over UDP
+/// would forward the reply to the client itself. Datagrams are capped at the UDP payload
+/// limit; a larger message is an error rather than a silent truncation.
+#[derive(Debug, Default)]
+pub struct UdpTransport;
+
+impl Transport for UdpTransport {
+    fn send<'a>(
+        &'a self,
+        address: &'a str,
+        message: &'a Message,
+    ) -> Pin<Box<dyn Future<Output = std::io::Result<Message>> + Send + 'a>> {
+        Box::pin(async move {
+            let buf = serde_json::to_vec(message)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            let socket = UdpSocket::bind("0.0.0.0:0").await?;
+            socket.connect(address).await?;
+            socket.send(&buf).await?;
+            let mut buf = vec![0u8; MAX_DATAGRAM_BYTES];
+            let len = socket.recv(&mut buf).await?;
+            serde_json::from_slice(&buf[..len])
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        })
+    }
+}
+
+/// The largest UDP payload the carrier will send or receive.
+pub const MAX_DATAGRAM_BYTES: usize = 65_507;
+
+/// Serves the engine over UDP. Each datagram carries one message exchange.
+pub async fn serve_udp(
+    engine: Arc<Mutex<Engine>>,
+    addr: &str,
+    resolver: Arc<dyn Resolver>,
+) -> std::io::Result<()> {
+    let socket = UdpSocket::bind(addr).await?;
+    serve_udp_on(engine, socket, resolver).await
+}
+
+/// Serves the engine over an already-bound UDP socket.
+pub async fn serve_udp_on(
+    engine: Arc<Mutex<Engine>>,
+    socket: UdpSocket,
+    resolver: Arc<dyn Resolver>,
+) -> std::io::Result<()> {
+    loop {
+        let mut buf = vec![0u8; MAX_DATAGRAM_BYTES];
+        let (len, peer) = socket.recv_from(&mut buf).await?;
+        let message: Message = match serde_json::from_slice(&buf[..len]) {
+            Ok(message) => message,
+            Err(_) => continue,
+        };
+        if let Message::Request(mut request) = message {
+            let _ = {
+                let mut engine = engine.lock().await;
+                engine.handle(&mut request, &*resolver).await
+            };
+            if let Ok(out) = serde_json::to_vec(&Message::Request(request)) {
+                let _ = socket.send_to(&out, peer).await;
+            }
+        }
     }
 }
 
@@ -200,6 +266,7 @@ mod tests {
     use crate::datapad::split_to_pads;
     use crate::engine::{Engine, PAD_DIM, Request};
     use crate::target::{FnResolver, Target};
+    use tokio::net::UdpSocket;
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
@@ -281,6 +348,27 @@ mod tests {
 
         handle_a.abort();
         handle_b.abort();
+    }
+
+    #[tokio::test]
+    async fn a_request_travels_over_udp() {
+        let listener = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let engine = Arc::new(Mutex::new(Engine::new(
+            "node-a".to_string(),
+            vec![0.0; PAD_DIM],
+            vec![],
+        )));
+        let resolver = Arc::new(FnResolver(|_: &Target, _: &serde_json::Value| {
+            Some(serde_json::json!("udp-answer"))
+        }));
+        let handle = tokio::spawn(async move { serve_udp_on(engine, listener, resolver).await });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let response = send_with(&UdpTransport, &addr.to_string(), &request("req-udp")).await.unwrap();
+        assert_eq!(response.answer, Some(serde_json::json!("udp-answer")));
+        handle.abort();
     }
 
     #[tokio::test]
