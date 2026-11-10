@@ -151,6 +151,7 @@ pub fn gather(manifest: &FileManifest, pads: &[DataPad]) -> Result<Vec<Shard>, D
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::PAD_DIM;
 
     #[test]
     fn a_file_splits_and_reconstructs_exactly() {
@@ -190,6 +191,23 @@ mod tests {
         // is the case that must be caught.
         shards[1].index = 5;
         assert!(matches!(reconstruct(&manifest, shards), Err(DataPadError::OutOfOrder { .. })));
+    }
+
+    #[test]
+    fn a_thousand_pads_construct_a_single_file() {
+        let data: Vec<u8> = (0..100_000u32).map(|i| (i % 256) as u8).collect();
+        let (manifest, shards) = split(&data, DEFAULT_SHARD_COUNT).unwrap();
+        assert_eq!(shards.len(), DEFAULT_SHARD_COUNT);
+
+        let pads: Vec<DataPad> = shards
+            .into_iter()
+            .enumerate()
+            .map(|(i, shard)| attach(format!("pad-{i}"), vec![0.0; PAD_DIM], shard))
+            .collect();
+        assert_eq!(pads.len(), 1000);
+
+        let gathered = gather(&manifest, &pads).unwrap();
+        assert_eq!(reconstruct(&manifest, gathered).unwrap(), data);
     }
 
     #[test]
