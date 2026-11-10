@@ -575,6 +575,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_unreachable_next_hop_still_gets_a_response_not_a_hang() {
+        // A port that was bound and then dropped: connecting is refused immediately, so the
+        // server falls through to answering the client itself rather than hanging.
+        let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_addr = dead.local_addr().unwrap().to_string();
+        drop(dead);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let engine = Arc::new(Mutex::new(Engine::new(
+            "node-a".to_string(),
+            vec![1.0; PAD_DIM],
+            vec![dead_addr.clone()],
+        )));
+        let handle = tokio::spawn(async move {
+            serve_on(
+                engine,
+                listener,
+                Arc::new(FnResolver(|_: &Target, _: &serde_json::Value| None)),
+            )
+            .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            send(&addr.to_string(), &request("req-dead")),
+        )
+        .await
+        .expect("an unreachable hop must not hang the client")
+        .unwrap();
+        // No answer -- the hop never came back -- but the chain still carries this node's own
+        // contribution, so the client can see how far the request got.
+        assert_eq!(response.answer, None);
+        assert_eq!(response.contributions.len(), 1);
+        assert_eq!(response.contributions[0].node_id, "node-a");
+        handle.abort();
+    }
+
+    #[tokio::test]
     async fn a_file_is_gathered_from_two_nodes_and_reconstructed() {
         let data: Vec<u8> = (0..100u8).collect();
         let pad_ids = vec!["node-a".to_string(), "node-b".to_string()];
