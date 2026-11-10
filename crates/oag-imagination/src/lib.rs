@@ -19,6 +19,7 @@ pub mod engine;
 pub mod node;
 pub mod socket;
 pub mod source;
+pub mod target;
 
 pub use datapad::{
     attach, gather, reconstruct, split, split_to_pads, DataPad, DataPadError, FileManifest, Shard,
@@ -34,3 +35,4 @@ pub use socket::{
 };
 pub use node::{NodeAdapter, NodeError};
 pub use source::{HardwareRandom, MixedSource, RandomSource, SoftwareRandom};
+pub use target::{CompositeResolver, LocalResolver, Resolver, Target};

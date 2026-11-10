@@ -27,6 +27,14 @@ Three ideas:
 - **Not a trustless beacon.** The pad is a representation, not a guarantee.
 - **Not a data store for real claims.** That is `oag` and `oag-mesh`.
 
+## Request targets and resolvers
+
+A request can be anything, so the target is typed rather than a single hardcoded shape:
+`Url`, `Cid`, `Peer`, `Query`, `Store`, and `Other` for everything else. `Target::infer` guesses
+a kind from a JSON value -- a convenience, not a validation. A resolver answers the targets it
+knows how to answer and returns `None` for the rest; a `CompositeResolver` tries each resolver in
+order, and the engine routes what none of them answer.
+
 ## Wiring into `oag`
 
 The layer does not keep its own copy of the pad or the peer list. `node::NodeAdapter` reads the
