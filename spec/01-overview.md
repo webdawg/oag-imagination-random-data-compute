@@ -31,9 +31,18 @@ Three ideas:
 
 A request can be anything, so the target is typed rather than a single hardcoded shape:
 `Url`, `Cid`, `Peer`, `Query`, `Store`, and `Other` for everything else. `Target::infer` guesses
-a kind from a JSON value -- a convenience, not a validation. A resolver answers the targets it
-knows how to answer and returns `None` for the rest; a `CompositeResolver` tries each resolver in
-order, and the engine routes what none of them answer.
+a kind from a JSON value -- a convenience, not a validation.
+
+Resolvers are async, because a remote target (a URL, a CID, a peer) is fetched, not looked up:
+
+- `UrlResolver` -- answers `Url` by fetching it over HTTP and returning the status and body.
+- `LocalResolver` -- a map-backed store answering `Store` and `Query`.
+- `CompositeResolver` -- tries each resolver in order, first answer wins.
+- `FnResolver` -- adapts a synchronous closure, for tests and simple cases.
+
+The engine routes what none of them answer. A URL fetch is verified by the HTTP status and
+returned as data; it is not a trustless fetch, and a deployment that needs one should use the
+base project's verified gateway.
 
 ## Wiring into `oag`
 

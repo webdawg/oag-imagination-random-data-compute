@@ -20,6 +20,7 @@ use tokio::sync::Mutex;
 
 use crate::datapad::{self, DataPad, DataPadError, FileManifest};
 use crate::engine::{Engine, HandleOutcome, Request};
+use crate::target::Resolver;
 
 /// The largest message a peer will accept, matching the base project's body-size caps.
 pub const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
@@ -111,25 +112,22 @@ pub async fn send_with(
 /// Serves the engine over TCP. Each connection carries one message exchange. When the engine
 /// routes a request onward, the server forwards it to the next node and returns that node's
 /// response, so the client sees the whole chain. A `PadRequest` returns this node's data pad.
-pub async fn serve<F>(engine: Arc<Mutex<Engine>>, addr: &str, resolver: F) -> std::io::Result<()>
-where
-    F: Fn(&Request) -> Option<serde_json::Value> + Send + Sync + 'static,
-{
+pub async fn serve(
+    engine: Arc<Mutex<Engine>>,
+    addr: &str,
+    resolver: Arc<dyn Resolver>,
+) -> std::io::Result<()> {
     let listener = TcpListener::bind(addr).await?;
     serve_on(engine, listener, resolver).await
 }
 
 /// Serves the engine over an already-bound listener -- the same loop `serve` runs, exposed so a
 /// caller (or a test) can bind to `127.0.0.1:0` and learn the assigned port.
-pub async fn serve_on<F>(
+pub async fn serve_on(
     engine: Arc<Mutex<Engine>>,
     listener: TcpListener,
-    resolver: F,
-) -> std::io::Result<()>
-where
-    F: Fn(&Request) -> Option<serde_json::Value> + Send + Sync + 'static,
-{
-    let resolver = Arc::new(resolver);
+    resolver: Arc<dyn Resolver>,
+) -> std::io::Result<()> {
     loop {
         let (mut stream, _) = listener.accept().await?;
         let engine = engine.clone();
@@ -143,7 +141,7 @@ where
                 Message::Request(mut request) => {
                     let outcome = {
                         let mut engine = engine.lock().await;
-                        engine.handle(&mut request, |r| resolver(r))
+                        engine.handle(&mut request, &*resolver).await
                     };
                     if let HandleOutcome::RouteTo(next) = outcome {
                         if let Ok(mut upstream) = TcpStream::connect(&next).await {
@@ -201,6 +199,7 @@ mod tests {
     use super::*;
     use crate::datapad::split_to_pads;
     use crate::engine::{Engine, PAD_DIM, Request};
+    use crate::target::{FnResolver, Target};
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
@@ -220,7 +219,12 @@ mod tests {
         let addr_b = listener_b.local_addr().unwrap();
         let engine_b = Arc::new(Mutex::new(Engine::new("node-b".to_string(), vec![0.0; PAD_DIM], vec![])));
         let handle_b = tokio::spawn(async move {
-            serve_on(engine_b, listener_b, |_| Some(serde_json::json!("answer-from-b"))).await
+            serve_on(
+                engine_b,
+                listener_b,
+                Arc::new(FnResolver(|_: &Target, _: &serde_json::Value| Some(serde_json::json!("answer-from-b")))),
+            )
+            .await
         });
 
         let listener_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -230,7 +234,9 @@ mod tests {
             vec![1.0; PAD_DIM],
             vec![addr_b.to_string()],
         )));
-        let handle_a = tokio::spawn(async move { serve_on(engine_a, listener_a, |_| None).await });
+        let handle_a = tokio::spawn(async move {
+            serve_on(engine_a, listener_a, Arc::new(FnResolver(|_: &Target, _: &serde_json::Value| None))).await
+        });
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
@@ -254,14 +260,18 @@ mod tests {
         let mut engine_a = Engine::new("node-a".to_string(), vec![0.0; PAD_DIM], vec![]);
         engine_a.shard = Some(shards[0].clone());
         let engine_a = Arc::new(Mutex::new(engine_a));
-        let handle_a = tokio::spawn(async move { serve_on(engine_a, listener_a, |_| None).await });
+        let handle_a = tokio::spawn(async move {
+            serve_on(engine_a, listener_a, Arc::new(FnResolver(|_: &Target, _: &serde_json::Value| None))).await
+        });
 
         let listener_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr_b = listener_b.local_addr().unwrap();
         let mut engine_b = Engine::new("node-b".to_string(), vec![0.0; PAD_DIM], vec![]);
         engine_b.shard = Some(shards[1].clone());
         let engine_b = Arc::new(Mutex::new(engine_b));
-        let handle_b = tokio::spawn(async move { serve_on(engine_b, listener_b, |_| None).await });
+        let handle_b = tokio::spawn(async move {
+            serve_on(engine_b, listener_b, Arc::new(FnResolver(|_: &Target, _: &serde_json::Value| None))).await
+        });
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
@@ -311,7 +321,9 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         // A node with no shard.
         let engine = Arc::new(Mutex::new(Engine::new("node-a".to_string(), vec![0.0; PAD_DIM], vec![])));
-        let handle = tokio::spawn(async move { serve_on(engine, listener, |_| None).await });
+        let handle = tokio::spawn(async move {
+            serve_on(engine, listener, Arc::new(FnResolver(|_: &Target, _: &serde_json::Value| None))).await
+        });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let result = gather_file(&manifest, &[addr.to_string()]).await;

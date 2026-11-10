@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::datapad::Shard;
 use crate::source::{RandomSource, SoftwareRandom};
+use crate::target::{Resolver, Target};
 
 pub const CONTRIBUTION_DOMAIN: &[u8] = b"OAG-IMAGINATION:CONTRIBUTION:v1:";
 pub const ROUTE_DOMAIN: &[u8] = b"OAG-IMAGINATION:ROUTE:v1:";
@@ -216,11 +217,7 @@ impl Engine {
     /// Processes a request: adds this node's contribution, then either answers it (if `resolver`
     /// returns `Some`) or routes it to the next hop. The pad is reinforced for the hop it chose,
     /// so traffic strengthens the path it travels.
-    pub fn handle(
-        &mut self,
-        request: &mut Request,
-        resolver: impl Fn(&Request) -> Option<serde_json::Value>,
-    ) -> HandleOutcome {
+    pub async fn handle(&mut self, request: &mut Request, resolver: &dyn Resolver) -> HandleOutcome {
         let value = self.source.next();
         let previous = request
             .contributions
@@ -233,7 +230,7 @@ impl Engine {
             previous: hex::encode(previous),
         });
 
-        if let Some(answer) = resolver(request) {
+        if let Some(answer) = resolver.resolve(&Target::infer(&request.target), &request.payload).await {
             request.answer = Some(answer);
             self.dreams.record(request.clone());
             return HandleOutcome::Answered;
@@ -259,6 +256,7 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::target::LocalResolver;
 
     fn request(id: &str) -> Request {
         Request {
@@ -270,15 +268,16 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_request_travels_and_gets_a_chain_of_contributions() {
+    #[tokio::test]
+    async fn a_request_travels_and_gets_a_chain_of_contributions() {
         let mut engine = Engine::new(
             "node-a".to_string(),
             vec![1.0; PAD_DIM],
             vec!["node-b".to_string(), "node-c".to_string()],
         );
+        let resolver = LocalResolver::new();
         let mut req = request("req-1");
-        let outcome = engine.handle(&mut req, |_| None);
+        let outcome = engine.handle(&mut req, &resolver).await;
         // Both neighbors have equal weight, so the pad-guided pick is one of them.
         assert!(matches!(outcome, HandleOutcome::RouteTo(ref next) if next == "node-b" || next == "node-c"));
         assert_eq!(req.contributions.len(), 1);
@@ -288,21 +287,24 @@ mod tests {
         assert!(engine.pad.iter().any(|v| *v > 1.0));
     }
 
-    #[test]
-    fn a_resolver_answers_and_the_dream_is_saved() {
+    #[tokio::test]
+    async fn a_resolver_answers_and_the_dream_is_saved() {
         let mut engine = Engine::new("node-a".to_string(), vec![1.0; PAD_DIM], vec![]);
+        let mut resolver = LocalResolver::new();
+        resolver.insert("target", serde_json::json!("answer"));
         let mut req = request("req-2");
-        let outcome = engine.handle(&mut req, |_| Some(serde_json::json!("answer")));
+        let outcome = engine.handle(&mut req, &resolver).await;
         assert_eq!(outcome, HandleOutcome::Answered);
         assert_eq!(req.answer, Some(serde_json::json!("answer")));
         assert_eq!(engine.dreams.len(), 1);
     }
 
-    #[test]
-    fn routing_with_no_neighbors_is_a_no_route() {
+    #[tokio::test]
+    async fn routing_with_no_neighbors_is_a_no_route() {
         let mut engine = Engine::new("node-a".to_string(), vec![], vec![]);
+        let resolver = LocalResolver::new();
         let mut req = request("req-3");
-        assert_eq!(engine.handle(&mut req, |_| None), HandleOutcome::NoRoute);
+        assert_eq!(engine.handle(&mut req, &resolver).await, HandleOutcome::NoRoute);
     }
 
     #[test]
