@@ -51,6 +51,7 @@ async fn run(
     offset: u64,
     good: Option<usize>,
     use_signal: bool,
+    switch_at: Option<usize>,
 ) -> Vec<f32> {
     let neighbours: Vec<String> = (0..neighbour_count).map(|i| format!("node-{i}")).collect();
     let mut engine = Engine::with_source(
@@ -62,6 +63,10 @@ async fn run(
     let resolver = FnResolver(|_: &Target, _: &serde_json::Value| None);
 
     let mut counts = vec![0usize; neighbours.len()];
+    // Counts since the switch, to measure how fast the pad abandons a neighbour that stopped
+    // answering -- the recovery horizon that `HOP_STEP` implies.
+    let mut since_switch = vec![0usize; neighbours.len()];
+    let mut recovery: Option<usize> = None;
     let started = Instant::now();
 
     for i in 0..decisions {
@@ -72,11 +77,30 @@ async fn run(
             contributions: vec![],
             answer: None,
         };
+        let switched = switch_at.is_some_and(|at| i >= at);
+        let good_now = match (good, switch_at, switched) {
+            (Some(k), Some(_), true) => Some((k + 1) % neighbour_count),
+            (Some(k), _, _) => Some(k),
+            (None, _, _) => None,
+        };
         if let HandleOutcome::RouteTo(next) = engine.handle(&mut request, &resolver).await {
             if let Some(index) = neighbours.iter().position(|n| n == &next) {
                 counts[index] += 1;
+                if switched {
+                    since_switch[index] += 1;
+                    if let (Some(at), Some(before), Some(after)) = (switch_at, good, good_now) {
+                        // Compare the pad's own weights, not the selection counts: the counts carry
+                        // the whole pre-switch history, so a neighbour that dominated for 10,000
+                        // decisions stays "ahead" on counts long after the pad has flipped.
+                        if recovery.is_none()
+                            && engine.pad.get(after) > engine.pad.get(before)
+                        {
+                            recovery = Some(i - at + 1);
+                        }
+                    }
+                }
                 if use_signal {
-                    let outcome = if good == Some(index) {
+                    let outcome = if good_now == Some(index) {
                         HopOutcome::Answered
                     } else {
                         HopOutcome::Failed
@@ -107,11 +131,29 @@ async fn run(
         .map(|(i, _)| i)
         .expect("at least one neighbour");
     println!(
-        "  [{label}] leader node-{leader} at {:.1}% after {} decisions in {:.2?}\n",
+        "  [{label}] leader node-{leader} at {:.1}% after {} decisions in {:.2?}",
         100.0 * final_share[leader],
         decisions,
         elapsed
     );
+    if let (Some(at), Some(recovery)) = (switch_at, recovery) {
+        let after = good.map(|k| (k + 1) % neighbour_count);
+        println!(
+            "  [{label}] at decision {at} the answering neighbour changed; the new one led \
+             {} decisions later",
+            recovery
+        );
+        let name = |k: Option<usize>| match k {
+            Some(k) => format!("node-{k}"),
+            None => "none".to_string(),
+        };
+        println!(
+            "  [{label}]   (answering neighbour: {} -> {})",
+            name(good),
+            name(after)
+        );
+    }
+    println!();
     final_share
 }
 
@@ -123,6 +165,7 @@ async fn main() {
     let mut offset = 0u64;
     let mut good = Some(0usize);
     let mut no_signal = false;
+    let mut switch_at: Option<usize> = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--neighbours" => neighbour_count = args.next().and_then(|v| v.parse().ok()).unwrap_or(4),
@@ -132,6 +175,9 @@ async fn main() {
             "--good" => good = args.next().and_then(|v| v.parse().ok()),
             // Reproduce the old constant reinforcement, as the control.
             "--no-signal" => no_signal = true,
+            // At this decision, the answering neighbour changes to the next one -- the topology
+            // change the pad has to recover from.
+            "--switch-at" => switch_at = args.next().and_then(|v| v.parse().ok()),
             other => {
                 eprintln!("unknown argument {other:?}");
                 std::process::exit(2);
@@ -146,12 +192,17 @@ async fn main() {
         Some(k) => println!("utility: node-{k} answers, every other neighbour is unreachable"),
         None => println!("utility: no neighbour answers (every hop fails)"),
     }
-    println!("share per neighbour at each checkpoint, most recent last\n");
+    println!("share per neighbour at each checkpoint, most recent last");
+    if let Some(at) = switch_at {
+        println!("at decision {at} the answering neighbour changes to the next one\n");
+    } else {
+        println!();
+    }
 
-    let signal = run("signal", neighbour_count, decisions, offset, good, true).await;
+    let signal = run("signal", neighbour_count, decisions, offset, good, true, switch_at).await;
 
     if no_signal {
-        let control = run("control", neighbour_count, decisions, offset, good, false).await;
+        let control = run("control", neighbour_count, decisions, offset, good, false, switch_at).await;
         println!(
             "signal leader share {:.3} vs control {:.3}",
             signal.iter().copied().fold(0.0f32, f32::max),

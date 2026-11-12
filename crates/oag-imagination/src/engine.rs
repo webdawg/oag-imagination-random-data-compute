@@ -284,13 +284,28 @@ pub enum HopOutcome {
     Failed,
 }
 
-/// How much a hop being answered multiplies that neighbour's weight.
-pub const HOP_ANSWERED_GAIN: f32 = 1.05;
+/// The log-space step applied to a neighbour's weight per observed outcome: `exp(+STEP)` when a
+/// hop is answered, `exp(-STEP)` when it cannot be reached.
+///
+/// One parameter rather than two, because the two round numbers they replace (`1.05`, `0.90`) were
+/// independent guesses. In exponential-weights form the *ratio* between an answered and a failed
+/// hop is what carries meaning -- it is `exp(2 * STEP)` per comparison -- and a single step makes
+/// the memory horizon derivable instead of tuned: after `n` more failures than answers, a neighbour
+/// is down by `exp(STEP * n)`, so the half-life is `ln 2 / STEP`.
+///
+/// At `0.1` that half-life is about 6.9 observed hops, and the answered/failed ratio is about
+/// `1.22`. Recovery after a topology change is measured in `examples/convergence.rs`, not guessed.
+pub const HOP_STEP: f32 = 0.1;
 
-/// How much an unreachable hop multiplies that neighbour's weight. Less than one, so a neighbour
-/// that keeps failing loses share to the ones that do not -- the weaken/dissolve half, driven by
-/// observation rather than by elapsed time.
-pub const HOP_FAILED_PENALTY: f32 = 0.9;
+/// Multiplier for a neighbour whose hop was answered.
+pub fn hop_answered_gain() -> f32 {
+    HOP_STEP.exp()
+}
+
+/// Multiplier for a neighbour whose hop could not be reached.
+pub fn hop_failed_penalty() -> f32 {
+    (-HOP_STEP).exp()
+}
 
 /// Strengthens the pad for the neighbor at `index` -- more traffic through a path makes the pad
 /// along that path stronger.
@@ -491,9 +506,9 @@ impl Engine {
             return;
         };
         match outcome {
-            HopOutcome::Answered => self.pad[index] *= HOP_ANSWERED_GAIN,
+            HopOutcome::Answered => self.pad[index] *= hop_answered_gain(),
             HopOutcome::Forwarded => {}
-            HopOutcome::Failed => self.pad[index] *= HOP_FAILED_PENALTY,
+            HopOutcome::Failed => self.pad[index] *= hop_failed_penalty(),
         }
         normalize(&mut self.pad);
     }

@@ -132,9 +132,15 @@ once it knows how the hop went.
 
 | outcome | effect |
 |---|---|
-| `Answered` -- the chain was answered past this hop | weight `*= 1.05` |
+| `Answered` -- the chain was answered past this hop | weight `*= exp(HOP_STEP)` |
 | `Forwarded` -- the hop passed it on, nobody answered | unchanged |
-| `Failed` -- connect, write, or read failed | weight `*= 0.90` |
+| `Failed` -- connect, write, or read failed | weight `*= exp(-HOP_STEP)` |
+
+`HOP_STEP` is `0.1`, a single log-space step in exponential-weights form. The answered/failed ratio
+per comparison is `exp(2 * HOP_STEP)`, about `1.22`, and the weight-ratio half-life is
+`ln 2 / HOP_STEP`, about 6.9 observations. It replaced two independent round numbers (`1.05` and
+`0.90`) because the *ratio* is what carries meaning, and one step makes the memory horizon derivable
+rather than tuned.
 
 Updates are multiplicative and followed by the normalization above. Multiplicative keeps every
 weight positive: an additive penalty could drive a slot negative, and `normalize` divides by the
@@ -146,13 +152,23 @@ deterministic source. With `--good 0`, node-0 answers and the other three are un
 
 | arm | leader | share |
 |---|---|---|
-| signal | `node-0`, the one that answers | 99.8% |
+| signal | `node-0`, the one that answers | 99.9% |
 | control (old constant reinforcement) | `node-2`, an arbitrary one | 59.6% |
 
 Both arms share the first few hundred draws, so the difference is not the draw -- it is that one arm
 has something to learn and the other does not. The control's 59.6% is lower than the 96.7% measured
 earlier for the same mechanism, because the pre-change code reinforced without normalizing and so
 assembled a larger total; the lock-in is the same phenomenon at a different scale.
+
+**Recovery after a topology change, measured.** `--switch-at 10000` makes the answering neighbour
+change at decision 10,000. The new neighbour's *weight* overtakes the old one's **1,061 decisions
+later** -- far slower than the 6.9-observation half-life would suggest, and the reason is worth
+stating: the half-life describes how fast a weight *ratio* moves per observation, but a deeply
+locked-in neighbour is chosen almost every time, so it is penalised almost every time *and* its
+selection rate falls as its weight falls. Recovering from a ~1000:1 lock-in therefore takes ~1,000
+decisions rather than ~66. That is the honest cost of a small step: stable against noise, slow to
+abandon a path that has started failing. A larger step trades those directly, and choosing it is a
+deployment decision rather than a coding one.
 
 **Scope.** Only the TCP carrier feeds outcomes back, because it is the only carrier that forwards:
 the UDP carrier answers locally by design, so there is no hop to observe. A node whose neighbours
