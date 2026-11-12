@@ -65,6 +65,33 @@ requests for the same thing tend to reuse it.
 
 The pad is not over-designed. The mechanisms around it change it, and the traffic shapes it.
 
+### The pad must cover every neighbour, and they must be explorable
+
+`route` picks weighted by the pad, so a neighbour with weight `0` -- or with no slot at all --
+shares only the `1e-6` floor with slots that have been reinforced, and is never chosen often
+enough to be reinforced in turn. That deadlock (no traffic, so no reinforcement, so no traffic)
+meant the pad could strengthen a path and let the others lose share, but could never *form* one:
+a neighbour the pad did not cover was frozen out for the life of the process.
+
+The pad and the neighbour list come from different layers and nothing reconciled them, so this was
+reachable with no misconfiguration -- `node.rs` passes the stored pad and the neighbour list
+straight to the engine. `Engine::with_source` now seeds the pad to one slot per neighbour, filling
+missing slots with the **mean of the existing slots**. A fresh all-zero pad has mean zero, which is
+exactly right: the floor already makes every neighbour equal there. A learned pad gives a newly
+covered neighbour an average share on first appearance, so it is actually tried.
+
+Measured, because the claim was previously only asserted: `reinforcing_a_neighbour_shifts_routing_toward_it`
+runs `route` over 256 fixed seeds and checks the distribution -- equal pads split about evenly, a
+pad reinforced 100x carries nearly all the traffic. `route` is deterministic given
+(pad, neighbours, seed), so the test is an exact measurement rather than a flaky sample.
+
+**What the pad still cannot do: weaken or dissolve.** `reinforce` only adds. A path that stops
+carrying traffic keeps its absolute weight forever; its *share* falls as others are reinforced, so
+it becomes negligible, but it never decays and can never be retired or out-competed by a path that
+was never tried. The mission's "pathways can strengthen, weaken, form, or dissolve" is therefore
+half implemented: strengthen and (after the seeding fix) form are real, weaken and dissolve are not.
+Adding decay is a design change with a rate to justify and is deliberately not smuggled in here.
+
 ## Pads can be combined
 
 Two or more pads can be combined (added element-wise) to represent a larger neighborhood or to

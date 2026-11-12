@@ -270,9 +270,34 @@ pub fn combine_pads(a: &[f32], b: &[f32]) -> Vec<f32> {
 
 /// Strengthens the pad for the neighbor at `index` -- more traffic through a path makes the pad
 /// along that path stronger.
+///
+/// An out-of-range index is ignored rather than panicking: the pad and the neighbour list are
+/// built by different layers, and a mismatch must degrade to "this path does not learn" rather
+/// than take the process down. [`Engine::with_source`] seeds the pad to one slot per neighbour so
+/// the case does not arise there.
 pub fn reinforce(pad: &mut [f32], index: usize, amount: f32) {
     if let Some(slot) = pad.get_mut(index) {
         *slot += amount;
+    }
+}
+
+/// The weight a pad slot is seeded with when the pad does not cover every neighbour: the mean of
+/// the slots it does have.
+///
+/// A newly appearing neighbour has to be *explorable*. `route` picks weighted by the pad, so a
+/// neighbour whose slot is missing -- or is zero while others have been reinforced -- shares only
+/// the `1e-6` floor, and is never chosen often enough to be reinforced in turn. That deadlock
+/// (no traffic, so no reinforcement, so no traffic) means the pad can strengthen a path and let
+/// others lose share, but cannot *form* one. Starting at the mean gives a new neighbour an
+/// average share on first appearance.
+///
+/// An all-zero pad has mean zero, which is exactly right: the floor already makes every neighbour
+/// equal, so a fresh node explores uniformly.
+fn seed_weight(pad: &[f32]) -> f32 {
+    if pad.is_empty() {
+        0.0
+    } else {
+        pad.iter().sum::<f32>() / pad.len() as f32
     }
 }
 
@@ -316,6 +341,15 @@ impl Engine {
         neighbors: Vec<String>,
         source: Box<dyn RandomSource + Send + Sync>,
     ) -> Self {
+        // One slot per neighbour. The pad comes from the layer below and the neighbour list from
+        // elsewhere in it, and nothing reconciles them: a neighbour past the end of the pad could
+        // be routed to (the floor keeps it reachable) but never reinforced, because `reinforce`
+        // has no slot to add to. Seeding to the mean makes it explorable instead of frozen.
+        let mut pad = pad;
+        if pad.len() < neighbors.len() {
+            let seed = seed_weight(&pad);
+            pad.resize(neighbors.len(), seed);
+        }
         Self { node_id, pad, neighbors, dreams: DreamLog::new(), shard: None, source }
     }
 
@@ -563,6 +597,80 @@ mod tests {
         assert_eq!(outcome, HandleOutcome::Answered);
         assert_eq!(req.answer, Some(serde_json::json!("answer")));
         assert_eq!(engine.dreams.len(), 1);
+    }
+
+    /// The pad's central claim -- traffic through a path strengthens it, so repeated requests
+    /// reuse it -- measured as a distribution over fixed seeds. `route` is deterministic given
+    /// (pad, neighbours, seed), so this is an exact measurement, not a flaky sample.
+    #[test]
+    fn reinforcing_a_neighbour_shifts_routing_toward_it() {
+        let neighbors = vec!["node-a".to_string(), "node-b".to_string()];
+        let seeds: Vec<[u8; 32]> = (0..256u32)
+            .map(|i| {
+                let mut seed = [0u8; 32];
+                seed[..4].copy_from_slice(&i.to_le_bytes());
+                seed
+            })
+            .collect();
+        let share_of_a = |pad: &[f32]| {
+            seeds
+                .iter()
+                .filter(|seed| route(pad, &neighbors, seed).as_deref() == Some("node-a"))
+                .count()
+        };
+
+        let even = share_of_a(&[1.0, 1.0]);
+        assert!(
+            (96..=160).contains(&even),
+            "equal pads must split traffic about evenly, got {even}/256"
+        );
+
+        let reinforced = share_of_a(&[100.0, 1.0]);
+        assert!(
+            reinforced >= 240,
+            "a pad reinforced 100x must carry nearly all the traffic, got {reinforced}/256"
+        );
+    }
+
+    /// A neighbour the pad does not cover must be *explorable*, not merely reachable through the
+    /// `1e-6` floor. Without a slot, `reinforce` has nothing to add to, so the neighbour is never
+    /// chosen often enough to be reinforced in turn -- the pad can lose share but never form a
+    /// pathway. `Engine::with_source` seeds such a slot to the mean weight.
+    #[test]
+    fn a_neighbour_beyond_the_pad_is_explorable_not_frozen() {
+        let mut engine = Engine::new(
+            "node-a".to_string(),
+            vec![100.0, 1.0],
+            vec!["node-b".to_string(), "node-c".to_string(), "node-d".to_string()],
+        );
+        assert_eq!(engine.pad.len(), 3, "the pad must cover every neighbour");
+        assert_eq!(
+            engine.pad[2],
+            seed_weight(&[100.0, 1.0]),
+            "a newly covered neighbour starts at the mean weight"
+        );
+
+        let neighbors = engine.neighbors.clone();
+        let seeds: Vec<[u8; 32]> = (0..256u32)
+            .map(|i| {
+                let mut seed = [0u8; 32];
+                seed[..4].copy_from_slice(&i.to_le_bytes());
+                seed
+            })
+            .collect();
+        let to_d = seeds
+            .iter()
+            .filter(|seed| route(&engine.pad, &neighbors, seed).as_deref() == Some("node-d"))
+            .count();
+        assert!(
+            to_d > 40,
+            "a newly seeded neighbour must be explored at a meaningful rate, got {to_d}/256"
+        );
+
+        // And it is reinforced normally once traffic reaches it, closing the loop the floor
+        // alone could not.
+        reinforce(&mut engine.pad, 2, 1.0);
+        assert!(engine.pad[2] > seed_weight(&[100.0, 1.0]));
     }
 
     #[tokio::test]
