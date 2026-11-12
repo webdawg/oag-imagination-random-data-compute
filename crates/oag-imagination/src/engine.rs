@@ -281,23 +281,54 @@ pub fn reinforce(pad: &mut [f32], index: usize, amount: f32) {
     }
 }
 
-/// The weight a pad slot is seeded with when the pad does not cover every neighbour: the mean of
-/// the slots it does have.
+/// The mean every pad is normalized to.
 ///
-/// A newly appearing neighbour has to be *explorable*. `route` picks weighted by the pad, so a
-/// neighbour whose slot is missing -- or is zero while others have been reinforced -- shares only
-/// the `1e-6` floor, and is never chosen often enough to be reinforced in turn. That deadlock
-/// (no traffic, so no reinforcement, so no traffic) means the pad can strengthen a path and let
-/// others lose share, but cannot *form* one. Starting at the mean gives a new neighbour an
-/// average share on first appearance.
+/// A routing decision only reads weight *ratios*, so the pad's absolute scale carries no routing
+/// information -- but it is not free, because the pad is also this node's published representation
+/// and `combine_pads` adds pads element-wise. An unbounded pad makes both traffic-volume-weighted:
+/// a node that has forwarded a million requests dominates one that has forwarded ten, and two
+/// nodes' pads cannot be compared. Keeping the mean at 1.0 leaves routing exactly as it was and
+/// makes combination reflect two preferences rather than two traffic counts.
+pub const PAD_MEAN: f32 = 1.0;
+
+/// The weight a pad slot gets when it carries no information about its neighbour -- the mean of
+/// the slots that do.
 ///
-/// An all-zero pad has mean zero, which is exactly right: the floor already makes every neighbour
-/// equal, so a fresh node explores uniformly.
+/// A slot that is missing, or zero, must be *explorable*. `route` picks weighted by the pad, so
+/// such a slot shares only the `1e-6` floor with slots that have been reinforced, and is never
+/// chosen often enough to be reinforced in turn. That deadlock (no traffic, so no reinforcement,
+/// so no traffic) means the pad could strengthen a path and let others lose share, but could not
+/// *form* one. Starting at the mean gives an unexplored neighbour an average share on first
+/// appearance -- optimistic initialisation, with no rate to tune.
+///
+/// An all-zero pad has mean zero, and that is correct: the floor already routes over a fresh pad
+/// uniformly, so there is nothing to explore ahead of anything else.
 fn seed_weight(pad: &[f32]) -> f32 {
     if pad.is_empty() {
         0.0
     } else {
         pad.iter().sum::<f32>() / pad.len() as f32
+    }
+}
+
+/// Rescale a pad so its values average to [`PAD_MEAN`].
+///
+/// Routing only ever reads weight *ratios*, so the pad's absolute scale carries no routing
+/// information -- but it is not free, because the pad is also this node's published representation
+/// and `combine_pads` adds pads element-wise. An unbounded pad makes both traffic-volume-weighted:
+/// a node that has forwarded a million requests dominates one that has forwarded ten, and two
+/// nodes' pads cannot be compared. Normalizing keeps the mean at 1.0, leaves routing exactly as it
+/// was, and makes combination reflect the two preferences rather than the two traffic counts.
+///
+/// An all-zero pad is left alone: scaling it would divide by zero, and the floor already routes
+/// over a fresh pad uniformly.
+fn normalize(pad: &mut [f32]) {
+    let sum: f32 = pad.iter().sum();
+    if sum > 0.0 {
+        let scale = pad.len() as f32 / sum;
+        for slot in pad.iter_mut() {
+            *slot *= scale;
+        }
     }
 }
 
@@ -341,15 +372,23 @@ impl Engine {
         neighbors: Vec<String>,
         source: Box<dyn RandomSource + Send + Sync>,
     ) -> Self {
-        // One slot per neighbour. The pad comes from the layer below and the neighbour list from
-        // elsewhere in it, and nothing reconciles them: a neighbour past the end of the pad could
-        // be routed to (the floor keeps it reachable) but never reinforced, because `reinforce`
-        // has no slot to add to. Seeding to the mean makes it explorable instead of frozen.
+        // One slot per neighbour, and no slot left without information. The pad comes from the
+        // layer below and the neighbour list from elsewhere in it, and nothing reconciles them:
+        // a neighbour past the end of the pad could be routed to (the floor keeps it reachable)
+        // but never reinforced, because `reinforce` had no slot to add to. A zero slot is the same
+        // trap from the other side. Both are seeded to the neutral weight, then the whole pad is
+        // normalized so it stays comparable across nodes.
+        let seed = seed_weight(&pad);
         let mut pad = pad;
         if pad.len() < neighbors.len() {
-            let seed = seed_weight(&pad);
             pad.resize(neighbors.len(), seed);
         }
+        for slot in pad.iter_mut() {
+            if *slot == 0.0 {
+                *slot = seed;
+            }
+        }
+        normalize(&mut pad);
         Self { node_id, pad, neighbors, dreams: DreamLog::new(), shard: None, source }
     }
 
@@ -400,6 +439,10 @@ impl Engine {
             Some(next) => {
                 if let Some(index) = self.neighbors.iter().position(|n| n == &next) {
                     reinforce(&mut self.pad, index, 1.0);
+                    // Reinforcing only adds, so without this the pad grows without bound and its
+                    // absolute values -- which routing ignores, but `combine_pads` and the
+                    // published representation do not -- stop meaning anything.
+                    normalize(&mut self.pad);
                 }
                 HandleOutcome::RouteTo(next)
             }
@@ -635,7 +678,7 @@ mod tests {
     /// A neighbour the pad does not cover must be *explorable*, not merely reachable through the
     /// `1e-6` floor. Without a slot, `reinforce` has nothing to add to, so the neighbour is never
     /// chosen often enough to be reinforced in turn -- the pad can lose share but never form a
-    /// pathway. `Engine::with_source` seeds such a slot to the mean weight.
+    /// pathway. `Engine::with_source` seeds such a slot, and a zero slot the same way.
     #[test]
     fn a_neighbour_beyond_the_pad_is_explorable_not_frozen() {
         let mut engine = Engine::new(
@@ -644,11 +687,6 @@ mod tests {
             vec!["node-b".to_string(), "node-c".to_string(), "node-d".to_string()],
         );
         assert_eq!(engine.pad.len(), 3, "the pad must cover every neighbour");
-        assert_eq!(
-            engine.pad[2],
-            seed_weight(&[100.0, 1.0]),
-            "a newly covered neighbour starts at the mean weight"
-        );
 
         let neighbors = engine.neighbors.clone();
         let seeds: Vec<[u8; 32]> = (0..256u32)
@@ -658,19 +696,79 @@ mod tests {
                 seed
             })
             .collect();
-        let to_d = seeds
-            .iter()
-            .filter(|seed| route(&engine.pad, &neighbors, seed).as_deref() == Some("node-d"))
-            .count();
+        let share_of_d = |pad: &[f32]| {
+            seeds
+                .iter()
+                .filter(|seed| route(pad, &neighbors, seed).as_deref() == Some("node-d"))
+                .count()
+        };
+
+        // The pad is normalized to PAD_MEAN, so the seeded slot is the mean scaled by the pad's
+        // own total, and the pad's average is exactly PAD_MEAN.
+        let seed = seed_weight(&[100.0, 1.0]);
+        let scale = 3.0 / (100.0 + 1.0 + seed);
         assert!(
-            to_d > 40,
-            "a newly seeded neighbour must be explored at a meaningful rate, got {to_d}/256"
+            (engine.pad[2] - seed * scale).abs() < 1e-5,
+            "a newly covered neighbour starts at the mean share, got {}",
+            engine.pad[2]
+        );
+        let mean = engine.pad.iter().sum::<f32>() / engine.pad.len() as f32;
+        assert!((mean - PAD_MEAN).abs() < 1e-5, "the pad must be normalized, mean {mean}");
+
+        let before = share_of_d(&engine.pad);
+        assert!(
+            before > 40,
+            "a newly seeded neighbour must be explored at a meaningful rate, got {before}/256"
         );
 
         // And it is reinforced normally once traffic reaches it, closing the loop the floor
         // alone could not.
         reinforce(&mut engine.pad, 2, 1.0);
-        assert!(engine.pad[2] > seed_weight(&[100.0, 1.0]));
+        normalize(&mut engine.pad);
+        let after = share_of_d(&engine.pad);
+        assert!(
+            after > before,
+            "a reinforced neighbour must take a larger share, {before} -> {after}"
+        );
+    }
+
+    /// Routing reads weight ratios only, so the pad's absolute scale is free -- and the published
+    /// representation and `combine_pads` must not depend on how much traffic a node happens to have
+    /// seen. Two nodes with the same preference produce the same pad.
+    #[test]
+    fn two_nodes_with_the_same_preference_produce_the_same_pad() {
+        let a = Engine::new(
+            "a".to_string(),
+            vec![100.0, 1.0],
+            vec!["n1".to_string(), "n2".to_string()],
+        );
+        let b = Engine::new(
+            "b".to_string(),
+            vec![10.0, 0.1],
+            vec!["n1".to_string(), "n2".to_string()],
+        );
+        for (x, y) in a.pad.iter().zip(&b.pad) {
+            assert!((x - y).abs() < 1e-5, "same preference, different traffic: {x} vs {y}");
+        }
+    }
+
+    /// A zero slot is the same trap as a missing one: it shares only the floor, so it is never
+    /// reinforced and never recovers. A pad from the layer below can have slots that were never
+    /// used, so this is reachable without any misconfiguration.
+    #[test]
+    fn a_zero_slot_is_seeded_like_a_missing_one() {
+        let engine = Engine::new(
+            "node-a".to_string(),
+            vec![100.0, 0.0, 0.0],
+            vec!["node-b".to_string(), "node-c".to_string(), "node-d".to_string()],
+        );
+        assert!(
+            engine.pad.iter().all(|v| *v > 0.0),
+            "no slot may be left at zero: {:?}",
+            engine.pad
+        );
+        let mean = engine.pad.iter().sum::<f32>() / engine.pad.len() as f32;
+        assert!((mean - PAD_MEAN).abs() < 1e-5, "the pad must be normalized, mean {mean}");
     }
 
     #[tokio::test]

@@ -85,12 +85,32 @@ runs `route` over 256 fixed seeds and checks the distribution -- equal pads spli
 pad reinforced 100x carries nearly all the traffic. `route` is deterministic given
 (pad, neighbours, seed), so the test is an exact measurement rather than a flaky sample.
 
-**What the pad still cannot do: weaken or dissolve.** `reinforce` only adds. A path that stops
-carrying traffic keeps its absolute weight forever; its *share* falls as others are reinforced, so
-it becomes negligible, but it never decays and can never be retired or out-competed by a path that
-was never tried. The mission's "pathways can strengthen, weaken, form, or dissolve" is therefore
-half implemented: strengthen and (after the seeding fix) form are real, weaken and dissolve are not.
-Adding decay is a design change with a rate to justify and is deliberately not smuggled in here.
+### The pad is a normalized preference, not a traffic counter
+
+Routing reads weight *ratios* only, so a pad's absolute scale carries no routing information. That
+does not make the scale free: the pad is also this node's published representation and
+`combine_pads` adds pads element-wise. Unbounded, the pad makes both traffic-volume-weighted -- a
+node that has forwarded a million requests dominates one that has forwarded ten, and two nodes' pads
+cannot be compared at all.
+
+Every pad is therefore normalized to a mean of `1.0` (`PAD_MEAN`), at construction and after every
+reinforcement. This leaves routing exactly as it was and makes the representation comparable. The
+cost is that absolute traffic volume is no longer recoverable from the pad; nothing in this crate
+used it, and a deployment that wants it should record it separately rather than reading it back out
+of the weights.
+
+A slot that is missing **or zero** is seeded to the mean of the slots that carry information, which
+is the same optimistic-initialisation rule applied uniformly. A zero slot is the missing-slot trap
+from the other side: it shares only the `1e-6` floor, so it is never chosen often enough to be
+reinforced, and a pad from the layer below can have zero slots without any misconfiguration.
+
+**Weakening and dissolving are relative, and that is enough for routing.** Because routing reads
+ratios, a path that stops carrying traffic loses share as others are reinforced and can be
+out-competed by a newly seeded neighbour. Its *absolute* weight never falls, but nothing reads
+absolute weights any more. What the pad genuinely cannot do is forget: a path that was reinforced
+once keeps its weight forever, so a topology change that makes it useless does not remove it, only
+dilutes it. Whether an explicit decay term is worth its rate is an open design question, recorded
+in the mission research journal rather than settled here.
 
 ## Pads can be combined
 
