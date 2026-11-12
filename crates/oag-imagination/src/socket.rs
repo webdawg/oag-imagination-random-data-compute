@@ -25,6 +25,19 @@ use crate::target::Resolver;
 /// The largest message a peer will accept, matching the base project's body-size caps.
 pub const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 
+/// How long an inbound connection may take to send its message before it is dropped.
+///
+/// Without this, a peer that completes the TCP handshake and then sends nothing holds a spawned
+/// task and a socket for as long as it likes, and enough of those exhaust the process -- a
+/// slowloris-shaped availability hole with no authentication in front of it. Same posture as the
+/// base project's outbound request bound (`spec/18`) and `oag-mesh`'s bound on outbound requests.
+pub const INBOUND_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long to wait for a forwarded request's upstream reply, or for the connect that precedes
+/// it, before giving up on that hop. A black-holed address otherwise holds the task for the
+/// operating system's connect timeout, which is minutes.
+pub const UPSTREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "body")]
 pub enum Message {
@@ -444,6 +457,20 @@ pub async fn serve(
     serve_on(engine, listener, resolver).await
 }
 
+/// The timeouts the serving loop applies, so a caller can retune them and a test can make them
+/// short enough to observe.
+#[derive(Debug, Clone, Copy)]
+pub struct Timeouts {
+    pub inbound_read: std::time::Duration,
+    pub upstream: std::time::Duration,
+}
+
+impl Default for Timeouts {
+    fn default() -> Self {
+        Self { inbound_read: INBOUND_READ_TIMEOUT, upstream: UPSTREAM_TIMEOUT }
+    }
+}
+
 /// Serves the engine over an already-bound listener -- the same loop `serve` runs, exposed so a
 /// caller (or a test) can bind to `127.0.0.1:0` and learn the assigned port.
 pub async fn serve_on(
@@ -451,14 +478,26 @@ pub async fn serve_on(
     listener: TcpListener,
     resolver: Arc<dyn Resolver>,
 ) -> std::io::Result<()> {
+    serve_on_with_timeouts(engine, listener, resolver, Timeouts::default()).await
+}
+
+/// As [`serve_on`], with explicit [`Timeouts`].
+pub async fn serve_on_with_timeouts(
+    engine: Arc<Mutex<Engine>>,
+    listener: TcpListener,
+    resolver: Arc<dyn Resolver>,
+    timeouts: Timeouts,
+) -> std::io::Result<()> {
     loop {
         let (mut stream, _) = listener.accept().await?;
         let engine = engine.clone();
         let resolver = resolver.clone();
         tokio::spawn(async move {
-            let message = match read_message(&mut stream).await {
-                Ok(message) => message,
-                Err(_) => return,
+            let message = match tokio::time::timeout(timeouts.inbound_read, read_message(&mut stream)).await {
+                Ok(Ok(message)) => message,
+                // A read error or a timeout: drop the connection. Neither is worth a log line
+                // per attempt, because a scanning peer can produce unlimited both.
+                _ => return,
             };
             match message {
                 Message::Request(mut request) => {
@@ -467,12 +506,24 @@ pub async fn serve_on(
                         engine.handle(&mut request, &*resolver).await
                     };
                     if let HandleOutcome::RouteTo(next) = outcome {
-                        if let Ok(mut upstream) = TcpStream::connect(&next).await {
-                            if write_message(&mut upstream, &Message::Request(request.clone()))
-                                .await
-                                .is_ok()
-                            {
-                                if let Ok(Message::Request(response)) = read_message(&mut upstream).await {
+                        // Both the connect and the reply are bounded. On timeout the request is
+                        // returned unanswered rather than left hanging, which is the same
+                        // "degrade, don't drop" posture the rest of this crate takes: the caller
+                        // gets its request back and can try another hop.
+                        let connected = tokio::time::timeout(timeouts.upstream, TcpStream::connect(&next)).await;
+                        if let Ok(Ok(mut upstream)) = connected {
+                            let sent = tokio::time::timeout(
+                                timeouts.upstream,
+                                write_message(&mut upstream, &Message::Request(request.clone())),
+                            )
+                            .await;
+                            if sent.as_ref().map(|r| r.is_ok()).unwrap_or(false) {
+                                let replied = tokio::time::timeout(
+                                    timeouts.upstream,
+                                    read_message(&mut upstream),
+                                )
+                                .await;
+                                if let Ok(Ok(Message::Request(response))) = replied {
                                     let _ = write_message(&mut stream, &Message::Request(response)).await;
                                     return;
                                 }
@@ -572,6 +623,43 @@ mod tests {
 
         handle_a.abort();
         handle_b.abort();
+    }
+
+    /// A peer that completes the handshake and then sends nothing used to hold a spawned task and
+    /// a socket for as long as it liked, and enough of those exhaust the process. The serving loop
+    /// must close the connection at its inbound timeout instead.
+    #[tokio::test]
+    async fn a_client_that_sends_nothing_is_dropped_at_the_inbound_timeout() {
+        use tokio::io::AsyncReadExt;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let engine = Arc::new(Mutex::new(Engine::new(
+            "node-a".to_string(),
+            vec![1.0; PAD_DIM],
+            vec![],
+        )));
+        let handle = tokio::spawn(async move {
+            serve_on_with_timeouts(
+                engine,
+                listener,
+                Arc::new(FnResolver(|_: &Target, _: &serde_json::Value| None)),
+                Timeouts {
+                    inbound_read: std::time::Duration::from_millis(50),
+                    upstream: std::time::Duration::from_millis(50),
+                },
+            )
+            .await
+        });
+
+        // Handshake completes, then the client stalls.
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let mut buf = [0u8; 1];
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(2), client.read(&mut buf)).await;
+        assert!(closed.is_ok(), "the server must close a client that never sends");
+        assert_eq!(closed.unwrap().unwrap(), 0, "a closed connection reads as EOF");
+
+        handle.abort();
     }
 
     #[tokio::test]

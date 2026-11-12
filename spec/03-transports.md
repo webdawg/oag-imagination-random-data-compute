@@ -43,6 +43,22 @@ routing engine) or a `PadRequest`/`PadResponse` pair (the data-pad gathering pat
 - `socket::gather_file` -- ask each node for its pad, gather the shards in manifest order, and
   reconstruct the file. A missing pad is an error, not a guess.
 
+**Every wait on the TCP carrier is bounded.** `INBOUND_READ_TIMEOUT` (30s) closes a connection
+whose peer completes the handshake and then sends nothing; `UPSTREAM_TIMEOUT` (30s) bounds both the
+connect to the next hop and the wait for its reply. Before these, a stalling client held a spawned
+task and a socket for as long as it liked -- a slowloris-shaped availability hole, with no
+authentication in front of it -- and a black-holed next hop held the task for the operating system's
+connect timeout, which is minutes. Both are the same posture as the base project's outbound request
+bound (`spec/18`) and `oag-mesh`'s. A hop that times out returns the request unanswered rather than
+leaving it hanging, matching the crate's "degrade, don't drop" rule.
+
+`serve_on_with_timeouts` takes a `Timeouts` so a deployment can retune the values and a test can
+make them short enough to observe; `serve`/`serve_on` use the defaults.
+
+**Not bounded: concurrent connections.** Nothing caps how many connections are served at once, so
+many slow clients can still exhaust tasks and sockets even though each one is now finite. A semaphore
+would close it, and it is not there yet.
+
 ## UDP (implemented)
 
 A second socket carrier: one datagram in, one datagram out. `UdpTransport` (client) and
