@@ -52,12 +52,14 @@ connect timeout, which is minutes. Both are the same posture as the base project
 bound (`spec/18`) and `oag-mesh`'s. A hop that times out returns the request unanswered rather than
 leaving it hanging, matching the crate's "degrade, don't drop" rule.
 
-`serve_on_with_timeouts` takes a `Timeouts` so a deployment can retune the values and a test can
-make them short enough to observe; `serve`/`serve_on` use the defaults.
+`DEFAULT_MAX_CONNECTIONS` (1024) caps how many connections are served at once. Timeouts make each
+connection finite but not their number, and enough simultaneous slow clients still exhaust tasks and
+sockets; the cap is an availability backpressure mechanism -- a full server stops accepting rather
+than queueing connections nobody is reading, so an accepted client waits for a slot instead of being
+served concurrently. It is deliberately generous, being a backstop rather than a throughput knob.
 
-**Not bounded: concurrent connections.** Nothing caps how many connections are served at once, so
-many slow clients can still exhaust tasks and sockets even though each one is now finite. A semaphore
-would close it, and it is not there yet.
+`serve_on_with_limits` takes a `Limits` (both timeouts and the cap) so a deployment can retune them
+and a test can make them small enough to observe; `serve`/`serve_on` use the defaults.
 
 ## UDP (implemented)
 

@@ -457,17 +457,29 @@ pub async fn serve(
     serve_on(engine, listener, resolver).await
 }
 
-/// The timeouts the serving loop applies, so a caller can retune them and a test can make them
-/// short enough to observe.
+/// The default cap on concurrently served connections.
+///
+/// Timeouts make each connection finite, but not their number: enough simultaneous slow clients
+/// still exhaust tasks and sockets. This is an availability backstop rather than a throughput
+/// tuning knob, which is why it is generous.
+pub const DEFAULT_MAX_CONNECTIONS: usize = 1024;
+
+/// The bounds the serving loop applies, so a caller can retune them and a test can make them small
+/// enough to observe.
 #[derive(Debug, Clone, Copy)]
-pub struct Timeouts {
+pub struct Limits {
     pub inbound_read: std::time::Duration,
     pub upstream: std::time::Duration,
+    pub max_connections: usize,
 }
 
-impl Default for Timeouts {
+impl Default for Limits {
     fn default() -> Self {
-        Self { inbound_read: INBOUND_READ_TIMEOUT, upstream: UPSTREAM_TIMEOUT }
+        Self {
+            inbound_read: INBOUND_READ_TIMEOUT,
+            upstream: UPSTREAM_TIMEOUT,
+            max_connections: DEFAULT_MAX_CONNECTIONS,
+        }
     }
 }
 
@@ -478,22 +490,30 @@ pub async fn serve_on(
     listener: TcpListener,
     resolver: Arc<dyn Resolver>,
 ) -> std::io::Result<()> {
-    serve_on_with_timeouts(engine, listener, resolver, Timeouts::default()).await
+    serve_on_with_limits(engine, listener, resolver, Limits::default()).await
 }
 
-/// As [`serve_on`], with explicit [`Timeouts`].
-pub async fn serve_on_with_timeouts(
+/// As [`serve_on`], with explicit [`Limits`].
+pub async fn serve_on_with_limits(
     engine: Arc<Mutex<Engine>>,
     listener: TcpListener,
     resolver: Arc<dyn Resolver>,
-    timeouts: Timeouts,
+    limits: Limits,
 ) -> std::io::Result<()> {
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(limits.max_connections));
     loop {
+        // Acquire before accepting, so a full server stops taking new connections rather than
+        // accepting them into a queue nobody is reading. The permit moves into the spawned task
+        // and is held until that connection finishes.
+        let Ok(permit) = semaphore.clone().acquire_owned().await else {
+            return Ok(());
+        };
         let (mut stream, _) = listener.accept().await?;
         let engine = engine.clone();
         let resolver = resolver.clone();
         tokio::spawn(async move {
-            let message = match tokio::time::timeout(timeouts.inbound_read, read_message(&mut stream)).await {
+            let _permit = permit;
+            let message = match tokio::time::timeout(limits.inbound_read, read_message(&mut stream)).await {
                 Ok(Ok(message)) => message,
                 // A read error or a timeout: drop the connection. Neither is worth a log line
                 // per attempt, because a scanning peer can produce unlimited both.
@@ -510,16 +530,16 @@ pub async fn serve_on_with_timeouts(
                         // returned unanswered rather than left hanging, which is the same
                         // "degrade, don't drop" posture the rest of this crate takes: the caller
                         // gets its request back and can try another hop.
-                        let connected = tokio::time::timeout(timeouts.upstream, TcpStream::connect(&next)).await;
+                        let connected = tokio::time::timeout(limits.upstream, TcpStream::connect(&next)).await;
                         if let Ok(Ok(mut upstream)) = connected {
                             let sent = tokio::time::timeout(
-                                timeouts.upstream,
+                                limits.upstream,
                                 write_message(&mut upstream, &Message::Request(request.clone())),
                             )
                             .await;
                             if sent.as_ref().map(|r| r.is_ok()).unwrap_or(false) {
                                 let replied = tokio::time::timeout(
-                                    timeouts.upstream,
+                                    limits.upstream,
                                     read_message(&mut upstream),
                                 )
                                 .await;
@@ -640,13 +660,14 @@ mod tests {
             vec![],
         )));
         let handle = tokio::spawn(async move {
-            serve_on_with_timeouts(
+            serve_on_with_limits(
                 engine,
                 listener,
                 Arc::new(FnResolver(|_: &Target, _: &serde_json::Value| None)),
-                Timeouts {
+                Limits {
                     inbound_read: std::time::Duration::from_millis(50),
                     upstream: std::time::Duration::from_millis(50),
+                    max_connections: DEFAULT_MAX_CONNECTIONS,
                 },
             )
             .await
@@ -659,6 +680,53 @@ mod tests {
         assert!(closed.is_ok(), "the server must close a client that never sends");
         assert_eq!(closed.unwrap().unwrap(), 0, "a closed connection reads as EOF");
 
+        handle.abort();
+    }
+
+    /// Timeouts make each connection finite; this makes their *number* finite. A full server stops
+    /// accepting rather than queueing connections nobody is reading, so a second client waits for
+    /// the first to finish instead of being served concurrently.
+    #[tokio::test]
+    async fn a_full_server_does_not_serve_a_second_connection_concurrently() {
+        use tokio::io::AsyncWriteExt;
+        use std::time::Instant;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let engine = Arc::new(Mutex::new(Engine::new(
+            "node-a".to_string(),
+            vec![1.0; PAD_DIM],
+            vec![],
+        )));
+        let handle = tokio::spawn(async move {
+            serve_on_with_limits(
+                engine,
+                listener,
+                Arc::new(FnResolver(|_: &Target, _: &serde_json::Value| Some(
+                    serde_json::json!("ok"),
+                ))),
+                Limits {
+                    inbound_read: std::time::Duration::from_millis(300),
+                    upstream: std::time::Duration::from_millis(300),
+                    max_connections: 1,
+                },
+            )
+            .await
+        });
+
+        // The first connection takes the only slot and then stalls.
+        let mut staller = TcpStream::connect(addr).await.unwrap();
+        let started = Instant::now();
+        let answered =
+            tokio::time::timeout(std::time::Duration::from_secs(5), send(&addr.to_string(), &request("req-2")))
+                .await;
+        let elapsed = started.elapsed();
+        assert!(answered.is_ok(), "the second client must eventually be served");
+        assert!(
+            elapsed >= std::time::Duration::from_millis(200),
+            "the second client must have waited for the stalled one, served in {elapsed:?}"
+        );
+        let _ = staller.shutdown().await;
         handle.abort();
     }
 
