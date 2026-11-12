@@ -19,7 +19,7 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::Mutex;
 
 use crate::datapad::{self, DataPad, DataPadError, FileManifest};
-use crate::engine::{Engine, HandleOutcome, Request};
+use crate::engine::{Engine, HandleOutcome, HopOutcome, Request};
 use crate::target::Resolver;
 
 /// The largest message a peer will accept, matching the base project's body-size caps.
@@ -530,24 +530,11 @@ pub async fn serve_on_with_limits(
                         // returned unanswered rather than left hanging, which is the same
                         // "degrade, don't drop" posture the rest of this crate takes: the caller
                         // gets its request back and can try another hop.
-                        let connected = tokio::time::timeout(limits.upstream, TcpStream::connect(&next)).await;
-                        if let Ok(Ok(mut upstream)) = connected {
-                            let sent = tokio::time::timeout(
-                                limits.upstream,
-                                write_message(&mut upstream, &Message::Request(request.clone())),
-                            )
-                            .await;
-                            if sent.as_ref().map(|r| r.is_ok()).unwrap_or(false) {
-                                let replied = tokio::time::timeout(
-                                    limits.upstream,
-                                    read_message(&mut upstream),
-                                )
-                                .await;
-                                if let Ok(Ok(Message::Request(response))) = replied {
-                                    let _ = write_message(&mut stream, &Message::Request(response)).await;
-                                    return;
-                                }
-                            }
+                        if forward_and_observe(&next, &request, &mut stream, &engine, limits.upstream)
+                            .await
+                            .is_some()
+                        {
+                            return;
                         }
                     }
                     let _ = write_message(&mut stream, &Message::Request(request)).await;
@@ -586,6 +573,53 @@ pub async fn gather_file_with(
     }
     let shards = datapad::gather(manifest, &pads)?;
     datapad::reconstruct(manifest, shards)
+}
+
+
+/// Forwards `request` to `next`, relays the reply to `client`, and tells the engine how the hop
+/// went. Returns whether a reply was relayed.
+///
+/// The outcome is the engine's only learning signal, and the carrier is the only place that knows
+/// it: an answered chain strengthens the neighbour that carried it, an unreachable one weakens it,
+/// and a forwarded-but-unanswered one is left alone. Without this the pad is a rich-get-richer
+/// random walk that locks onto whichever neighbour the early draws favoured -- see `HopOutcome`.
+async fn forward_and_observe(
+    next: &str,
+    request: &Request,
+    client: &mut TcpStream,
+    engine: &Arc<Mutex<Engine>>,
+    timeout: std::time::Duration,
+) -> Option<()> {
+    let connected = tokio::time::timeout(timeout, TcpStream::connect(next)).await;
+    let Ok(Ok(mut upstream)) = connected else {
+        engine.lock().await.observe_hop(next, HopOutcome::Failed);
+        return None;
+    };
+
+    let sent = tokio::time::timeout(
+        timeout,
+        write_message(&mut upstream, &Message::Request(request.clone())),
+    )
+    .await;
+    if !sent.as_ref().is_ok_and(|r| r.is_ok()) {
+        engine.lock().await.observe_hop(next, HopOutcome::Failed);
+        return None;
+    }
+
+    let replied = tokio::time::timeout(timeout, read_message(&mut upstream)).await;
+    let Ok(Ok(Message::Request(response))) = replied else {
+        engine.lock().await.observe_hop(next, HopOutcome::Failed);
+        return None;
+    };
+
+    let outcome = if response.answer.is_some() {
+        HopOutcome::Answered
+    } else {
+        HopOutcome::Forwarded
+    };
+    engine.lock().await.observe_hop(next, outcome);
+    let _ = write_message(client, &Message::Request(response)).await;
+    Some(())
 }
 
 #[cfg(test)]

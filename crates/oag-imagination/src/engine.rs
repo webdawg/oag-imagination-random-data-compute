@@ -268,6 +268,30 @@ pub fn combine_pads(a: &[f32], b: &[f32]) -> Vec<f32> {
     a.iter().zip(b.iter()).map(|(x, y)| x + y).collect()
 }
 
+/// How a forwarded hop turned out, as the carrier that forwarded it observes.
+///
+/// The pad is worth something only if reinforcement is driven by this. Rewarding whichever hop was
+/// taken, by a constant, is a rich-get-richer random walk that locks onto an arbitrary neighbour --
+/// measured in `examples/convergence.rs`, where shifting the source's start changes *which*
+/// neighbour wins while the ~96% share does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HopOutcome {
+    /// The chain was answered past this hop. The hop carried the request somewhere useful.
+    Answered,
+    /// The hop forwarded onward and nobody further down the chain answered. It did its part.
+    Forwarded,
+    /// The hop could not be reached: connect, write, or read failed.
+    Failed,
+}
+
+/// How much a hop being answered multiplies that neighbour's weight.
+pub const HOP_ANSWERED_GAIN: f32 = 1.05;
+
+/// How much an unreachable hop multiplies that neighbour's weight. Less than one, so a neighbour
+/// that keeps failing loses share to the ones that do not -- the weaken/dissolve half, driven by
+/// observation rather than by elapsed time.
+pub const HOP_FAILED_PENALTY: f32 = 0.9;
+
 /// Strengthens the pad for the neighbor at `index` -- more traffic through a path makes the pad
 /// along that path stronger.
 ///
@@ -402,8 +426,12 @@ impl Engine {
     }
 
     /// Processes a request: adds this node's contribution, then either answers it (if `resolver`
-    /// returns `Some`) or routes it to the next hop. The pad is reinforced for the hop it chose,
-    /// so traffic strengthens the path it travels.
+    /// returns `Some`) or routes it to the next hop.
+    ///
+    /// The pad is *not* changed here. Whether the chosen hop was any good is not known until the
+    /// carrier has forwarded the request and seen what came back, so reinforcement happens in
+    /// [`Engine::observe_hop`]. Rewarding the hop here, by a constant, is a rich-get-richer random
+    /// walk -- see `HopOutcome`.
     pub async fn handle(&mut self, request: &mut Request, resolver: &dyn Resolver) -> HandleOutcome {
         let value = self.source.next();
         let previous = request
@@ -437,13 +465,10 @@ impl Engine {
 
         match route(&self.pad, &self.neighbors, &seed) {
             Some(next) => {
-                if let Some(index) = self.neighbors.iter().position(|n| n == &next) {
-                    reinforce(&mut self.pad, index, 1.0);
-                    // Reinforcing only adds, so without this the pad grows without bound and its
-                    // absolute values -- which routing ignores, but `combine_pads` and the
-                    // published representation do not -- stop meaning anything.
-                    normalize(&mut self.pad);
-                }
+                // Deliberately no reinforcement here. At this moment the engine has no idea
+                // whether the hop was any good, and rewarding it anyway is what makes the pad
+                // lock onto an arbitrary neighbour. The carrier calls `observe_hop` once it
+                // knows; see `HopOutcome`.
                 HandleOutcome::RouteTo(next)
             }
             None => HandleOutcome::NoRoute,
@@ -451,10 +476,37 @@ impl Engine {
     }
 }
 
+impl Engine {
+    /// Records how the hop to `neighbour` turned out and moves the pad accordingly.
+    ///
+    /// This is the only thing that should change the pad's routing weights: `handle` routes but
+    /// deliberately does not reinforce, because it cannot yet know the outcome. Multiplicative
+    /// updates keep every weight positive -- an additive penalty could drive a slot negative, and
+    /// `normalize` divides by the sum, so a negative total would invert the ordering -- and
+    /// `normalize` afterwards keeps the mean at [`PAD_MEAN`].
+    ///
+    /// An unknown neighbour is ignored, matching [`reinforce`]'s out-of-range behaviour.
+    pub fn observe_hop(&mut self, neighbour: &str, outcome: HopOutcome) {
+        let Some(index) = self.neighbors.iter().position(|n| n == neighbour) else {
+            return;
+        };
+        match outcome {
+            HopOutcome::Answered => self.pad[index] *= HOP_ANSWERED_GAIN,
+            HopOutcome::Forwarded => {}
+            HopOutcome::Failed => self.pad[index] *= HOP_FAILED_PENALTY,
+        }
+        normalize(&mut self.pad);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::target::LocalResolver;
+
+    fn index_of(neighbors: &[String], target: &str) -> usize {
+        neighbors.iter().position(|n| n == target).expect("neighbour must be present")
+    }
 
     fn request(id: &str) -> Request {
         Request {
@@ -622,12 +674,37 @@ mod tests {
         let mut req = request("req-1");
         let outcome = engine.handle(&mut req, &resolver).await;
         // Both neighbors have equal weight, so the pad-guided pick is one of them.
-        assert!(matches!(outcome, HandleOutcome::RouteTo(ref next) if next == "node-b" || next == "node-c"));
+        let next = match outcome {
+            HandleOutcome::RouteTo(next) => next,
+            other => panic!("expected a route, got {other:?}"),
+        };
+        assert!(next == "node-b" || next == "node-c");
         assert_eq!(req.contributions.len(), 1);
         assert_eq!(req.contributions[0].node_id, "node-a");
 
-        // The pad strengthened for the chosen hop.
-        assert!(engine.pad.iter().any(|v| *v > 1.0));
+        // Routing alone must not move the pad: at this moment the engine cannot know whether the
+        // hop was any good, and rewarding it anyway is what made the pad lock onto an arbitrary
+        // neighbour.
+        let after_route = engine.pad.clone();
+        assert!(
+            after_route.iter().all(|v| (v - 1.0).abs() < 1e-6),
+            "routing must not change the pad, got {:?}",
+            engine.pad
+        );
+
+        // The carrier reports the outcome, and only then does the pad move -- toward a hop that
+        // answered, away from one that could not be reached.
+        engine.observe_hop(&next, HopOutcome::Answered);
+        assert!(
+            engine.pad.iter().any(|v| *v > 1.0),
+            "an answered hop must strengthen the neighbour that carried it"
+        );
+        let answered = engine.pad.clone();
+        engine.observe_hop(&next, HopOutcome::Failed);
+        assert!(
+            engine.pad[index_of(&engine.neighbors, &next)] < answered[index_of(&engine.neighbors, &next)],
+            "an unreachable hop must weaken the neighbour"
+        );
     }
 
     #[tokio::test]

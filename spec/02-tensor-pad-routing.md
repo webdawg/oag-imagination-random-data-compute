@@ -123,11 +123,41 @@ rich-get-richer random walk that locks onto whichever neighbour the first few hu
 favoured. The "repeated requests reuse the same path" claim is true but vacuous in the sense that
 matters: it reuses *an* arbitrary path, not a *better* one.
 
-**The missing piece is a utility signal, not a decay rate.** Decay would add forgetting but still no
-signal, so a pad that forgot one arbitrary lock-in would drift to another. The carrier already has
-the signal -- the TCP serving loop reads the upstream response, so the node that routed a hop sees
-whether it answered -- and `Engine::handle` returns `RouteTo(next)` and discards it. Plumbing the
-outcome back into the pad is a design change, not a parameter, and is not made here.
+### Reinforcement follows the hop's outcome
+
+Rewarding whichever hop was taken, by a constant, is what made the pad lock onto an arbitrary
+neighbour. Reinforcement is therefore driven by [`HopOutcome`], which the carrier observes and the
+engine cannot: `handle` routes and changes nothing, and the carrier calls `Engine::observe_hop`
+once it knows how the hop went.
+
+| outcome | effect |
+|---|---|
+| `Answered` -- the chain was answered past this hop | weight `*= 1.05` |
+| `Forwarded` -- the hop passed it on, nobody answered | unchanged |
+| `Failed` -- connect, write, or read failed | weight `*= 0.90` |
+
+Updates are multiplicative and followed by the normalization above. Multiplicative keeps every
+weight positive: an additive penalty could drive a slot negative, and `normalize` divides by the
+sum, so a negative total would invert the ordering rather than merely shrinking it. `Forwarded` is
+deliberately neutral -- the hop did its part, and there is no evidence against it.
+
+**Measured, as an A/B.** `examples/convergence.rs --no-signal` runs both arms over the same
+deterministic source. With `--good 0`, node-0 answers and the other three are unreachable:
+
+| arm | leader | share |
+|---|---|---|
+| signal | `node-0`, the one that answers | 99.8% |
+| control (old constant reinforcement) | `node-2`, an arbitrary one | 59.6% |
+
+Both arms share the first few hundred draws, so the difference is not the draw -- it is that one arm
+has something to learn and the other does not. The control's 59.6% is lower than the 96.7% measured
+earlier for the same mechanism, because the pre-change code reinforced without normalizing and so
+assembled a larger total; the lock-in is the same phenomenon at a different scale.
+
+**Scope.** Only the TCP carrier feeds outcomes back, because it is the only carrier that forwards:
+the UDP carrier answers locally by design, so there is no hop to observe. A node whose neighbours
+are reached over UDP therefore keeps a pad that does not learn, which is the honest consequence of
+that carrier's shape rather than an oversight.
 
 **Weakening and dissolving are relative, and that is enough for routing.** Because routing reads
 ratios, a path that stops carrying traffic loses share as others are reinforced and can be

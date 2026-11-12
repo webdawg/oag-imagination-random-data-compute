@@ -1,24 +1,35 @@
 //! Measures how the tensor pad's chosen-neighbour distribution evolves as it learns.
 //!
 //! ```text
-//! cargo run --example convergence [-- neighbours N] [-- decisions N]
+//! cargo run --example convergence [--neighbours N] [--decisions N] [--offset N]
+//!                             [--good K] [--no-signal]
 //! ```
 //!
 //! The pad's documented claim is that traffic strengthens the path it travels, so repeated
-//! requests reuse it. That is a statement about convergence, and it had never been measured --
-//! only asserted, and then only as a static distribution over fixed seeds. This runs the real
-//! engine over a deterministic source and prints the chosen-neighbour share at checkpoints, so the
-//! trajectory is a number rather than an impression.
+//! requests reuse it. That is a convergence claim, and it had never been measured -- only
+//! asserted, then only as a static distribution over fixed seeds.
 //!
-//! The resolver answers nothing, so every request is routed onward and the pad is exercised on its
-//! own. The source is `BLAKE3(counter)`, so a given run is exactly reproducible.
+//! **What it converged to, before this was fixed.** Rewarding whichever hop was taken, by a
+//! constant, is a rich-get-richer random walk: one neighbour took ~96% of all routing, and
+//! shifting the source's start changed *which* neighbour won while the share did not. The pad was
+//! not learning; it was drifting.
+//!
+//! **What this now compares.** `--good K` makes neighbour `K` answer and the rest unreachable, so
+//! there is a real utility difference to learn. The default follows it; `--no-signal` reproduces
+//! the old constant reinforcement as a control. If the mechanism works, the two panels differ: the
+//! signal should converge on `node-K`, the control on whichever neighbour the early draws favoured.
+//!
+//! The source is `BLAKE3(counter)`, so a run is exactly reproducible.
 
 use std::time::Instant;
 
-use oag_imagination::{Engine, FnResolver, HandleOutcome, PAD_DIM, RandomSource, Request, Target};
+use oag_imagination::{
+    reinforce, Engine, FnResolver, HandleOutcome, HopOutcome, PAD_DIM, RandomSource, Request,
+    Target,
+};
 
 /// A deterministic 32-byte source: `BLAKE3(counter)`. Reproducibility matters here -- the whole
-/// point is that a run can be compared against another run.
+/// point is that two runs can be compared.
 #[derive(Debug, Default)]
 struct CounterSource {
     counter: u64,
@@ -32,27 +43,15 @@ impl RandomSource for CounterSource {
     }
 }
 
-#[tokio::main]
-async fn main() {
-    let mut args = std::env::args().skip(1);
-    let mut neighbour_count = 4usize;
-    let mut decisions = 20_000usize;
-    let mut offset = 0u64;
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--neighbours" => neighbour_count = args.next().and_then(|v| v.parse().ok()).unwrap_or(4),
-            "--decisions" => decisions = args.next().and_then(|v| v.parse().ok()).unwrap_or(20_000),
-            // Shifts the source's starting point, which is the control: if a different offset
-            // crowns a different neighbour, the winner is decided by the early draws rather than
-            // by anything about the neighbours.
-            "--offset" => offset = args.next().and_then(|v| v.parse().ok()).unwrap_or(0),
-            other => {
-                eprintln!("unknown argument {other:?}");
-                std::process::exit(2);
-            }
-        }
-    }
-
+/// Runs one arm of the comparison and prints the share trajectory.
+async fn run(
+    label: &str,
+    neighbour_count: usize,
+    decisions: usize,
+    offset: u64,
+    good: Option<usize>,
+    use_signal: bool,
+) -> Vec<f32> {
     let neighbours: Vec<String> = (0..neighbour_count).map(|i| format!("node-{i}")).collect();
     let mut engine = Engine::with_source(
         "measuring-node".to_string(),
@@ -61,12 +60,6 @@ async fn main() {
         Box::new(CounterSource { counter: offset }),
     );
     let resolver = FnResolver(|_: &Target, _: &serde_json::Value| None);
-
-    println!(
-        "pad convergence: {neighbour_count} neighbours, {decisions} routing decisions, source offset {offset}"
-    );
-    println!("each request starts a fresh chain, so the routing seed varies per request\n");
-    println!("{:>10}  {:>12}  {}", "decision", "pad mean", "chosen share per neighbour");
 
     let mut counts = vec![0usize; neighbours.len()];
     let started = Instant::now();
@@ -82,37 +75,96 @@ async fn main() {
         if let HandleOutcome::RouteTo(next) = engine.handle(&mut request, &resolver).await {
             if let Some(index) = neighbours.iter().position(|n| n == &next) {
                 counts[index] += 1;
+                if use_signal {
+                    let outcome = if good == Some(index) {
+                        HopOutcome::Answered
+                    } else {
+                        HopOutcome::Failed
+                    };
+                    engine.observe_hop(&next, outcome);
+                } else {
+                    // The pre-change behaviour: reward the hop taken, regardless of outcome.
+                    reinforce(&mut engine.pad, index, 1.0);
+                }
             }
         }
 
-        if (i + 1) % (decisions / 20).max(1) == 0 {
-            let pad_mean: f32 = engine.pad.iter().sum::<f32>() / engine.pad.len() as f32;
+        if (i + 1) % (decisions / 10).max(1) == 0 {
             let shares: Vec<String> = counts
                 .iter()
                 .map(|c| format!("{:.3}", *c as f32 / (i + 1) as f32))
                 .collect();
-            println!("{:>10}  {:>12.4}  {}", i + 1, pad_mean, shares.join("  "));
+            println!("  [{label}] {i:>7}  {}", shares.join("  "));
         }
     }
 
     let elapsed = started.elapsed();
+    let final_share: Vec<f32> = counts.iter().map(|c| *c as f32 / decisions as f32).collect();
+    let leader = counts
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, c)| **c)
+        .map(|(i, _)| i)
+        .expect("at least one neighbour");
     println!(
-        "\n{} decisions in {:.2?} ({:.0} decisions/sec)",
+        "  [{label}] leader node-{leader} at {:.1}% after {} decisions in {:.2?}\n",
+        100.0 * final_share[leader],
         decisions,
-        elapsed,
-        decisions as f64 / elapsed.as_secs_f64().max(1e-9)
+        elapsed
     );
-    let leader = counts.iter().enumerate().max_by_key(|(_, c)| **c).map(|(i, _)| i);
-    if let Some(leader) = leader {
+    final_share
+}
+
+#[tokio::main]
+async fn main() {
+    let mut args = std::env::args().skip(1);
+    let mut neighbour_count = 4usize;
+    let mut decisions = 20_000usize;
+    let mut offset = 0u64;
+    let mut good = Some(0usize);
+    let mut no_signal = false;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--neighbours" => neighbour_count = args.next().and_then(|v| v.parse().ok()).unwrap_or(4),
+            "--decisions" => decisions = args.next().and_then(|v| v.parse().ok()).unwrap_or(20_000),
+            "--offset" => offset = args.next().and_then(|v| v.parse().ok()).unwrap_or(0),
+            // Which neighbour answers and which are unreachable. Omit for "none answers".
+            "--good" => good = args.next().and_then(|v| v.parse().ok()),
+            // Reproduce the old constant reinforcement, as the control.
+            "--no-signal" => no_signal = true,
+            other => {
+                eprintln!("unknown argument {other:?}");
+                std::process::exit(2);
+            }
+        }
+    }
+
+    println!(
+        "pad convergence: {neighbour_count} neighbours, {decisions} decisions, source offset {offset}"
+    );
+    match good {
+        Some(k) => println!("utility: node-{k} answers, every other neighbour is unreachable"),
+        None => println!("utility: no neighbour answers (every hop fails)"),
+    }
+    println!("share per neighbour at each checkpoint, most recent last\n");
+
+    let signal = run("signal", neighbour_count, decisions, offset, good, true).await;
+
+    if no_signal {
+        let control = run("control", neighbour_count, decisions, offset, good, false).await;
         println!(
-            "final leader: node-{leader} at {:.1}% of {} routable decisions",
-            100.0 * counts[leader] as f64 / decisions as f64,
-            decisions
+            "signal leader share {:.3} vs control {:.3}",
+            signal.iter().copied().fold(0.0f32, f32::max),
+            control.iter().copied().fold(0.0f32, f32::max)
+        );
+        let named = match good {
+            Some(k) => format!("node-{k}"),
+            None => "no neighbour (every hop fails)".to_string(),
+        };
+        println!(
+            "\nBoth arms share the first few hundred draws. The signal converges on {named}; \
+             the control converges on whichever neighbour those draws happened to favour. That \
+             difference is the whole point: the pad is now following observed utility."
         );
     }
-    println!(
-        "\nRead the last few rows: if the shares have stopped moving, the pad has converged -- and \
-         the neighbour it converged on is whichever one the first decisions happened to reinforce, \
-         because every hop is reinforced by the same constant regardless of how it turned out."
-    );
 }

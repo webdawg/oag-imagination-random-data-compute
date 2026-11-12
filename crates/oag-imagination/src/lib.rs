@@ -28,7 +28,8 @@ pub use datapad::{
 };
 pub use engine::{
     chain_contribution, combine_pads, reinforce, route, Contribution, DreamLog, Engine, EngineError,
-    HandleOutcome, Request, CONTRIBUTION_DOMAIN, PAD_DIM, ROUTE_DOMAIN,
+    HandleOutcome, HopOutcome, Request, CONTRIBUTION_DOMAIN, HOP_ANSWERED_GAIN,
+    HOP_FAILED_PENALTY, PAD_DIM, ROUTE_DOMAIN,
 };
 pub use socket::{
     gather_file, gather_file_with, read_message, send, send_with, serve, serve_on,
