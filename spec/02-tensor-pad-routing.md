@@ -104,6 +104,31 @@ is the same optimistic-initialisation rule applied uniformly. A zero slot is the
 from the other side: it shares only the `1e-6` floor, so it is never chosen often enough to be
 reinforced, and a pad from the layer below can have zero slots without any misconfiguration.
 
+### What the pad converges to, measured
+
+`examples/convergence.rs` runs the real engine over a deterministic source (`BLAKE3(counter)`) with
+a resolver that never answers, so every request is routed and the pad is exercised on its own. Over
+20,000 decisions with four neighbours, one neighbour takes about 96% of all routing, with the share
+climbing 0.568 at 1,000 decisions, 0.866 at 5,000, 0.933 at 10,000 and 0.966 at 20,000. The pad mean
+stays at exactly 1.0000 throughout.
+
+**Which** neighbour wins is decided by the early draws, not by anything about the neighbours:
+shifting the source's starting point (`--offset`) crowns `node-2` for offsets 0-3 and `node-3` for
+offsets 4-5, at the same ~96%.
+
+That is the honest reading of the mechanism. `reinforce` adds a constant `1.0` to whichever hop was
+taken, regardless of whether it answered, forwarded, or failed -- so the reinforcement carries no
+information about the hop's quality. The pad does not learn which neighbour is better; it is a
+rich-get-richer random walk that locks onto whichever neighbour the first few hundred decisions
+favoured. The "repeated requests reuse the same path" claim is true but vacuous in the sense that
+matters: it reuses *an* arbitrary path, not a *better* one.
+
+**The missing piece is a utility signal, not a decay rate.** Decay would add forgetting but still no
+signal, so a pad that forgot one arbitrary lock-in would drift to another. The carrier already has
+the signal -- the TCP serving loop reads the upstream response, so the node that routed a hop sees
+whether it answered -- and `Engine::handle` returns `RouteTo(next)` and discards it. Plumbing the
+outcome back into the pad is a design change, not a parameter, and is not made here.
+
 **Weakening and dissolving are relative, and that is enough for routing.** Because routing reads
 ratios, a path that stops carrying traffic loses share as others are reinforced and can be
 out-competed by a newly seeded neighbour. Its *absolute* weight never falls, but nothing reads
