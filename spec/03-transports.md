@@ -41,7 +41,11 @@ routing engine) or a `PadRequest`/`PadResponse` pair (the data-pad gathering pat
   chain; answer a `PadRequest` with the node's data pad.
 - `socket::send` -- send a request and read the response.
 - `socket::gather_file` -- ask each node for its pad, gather the shards in manifest order, and
-  reconstruct the file. A missing pad is an error, not a guess.
+  reconstruct the file. A missing pad is an error, not a guess. The requests are fanned out with
+  at most `MAX_CONCURRENT_GATHERS` (32) in flight: the sequential form cost one round-trip per
+  pad, and the default `DEFAULT_SHARD_COUNT` is a thousand pads. The manifest order is restored by
+  `datapad::gather`, which sorts by the manifest's `pad_ids`, so the fan-out does not reorder the
+  shards.
 
 **Every wait on the TCP carrier is bounded.** `INBOUND_READ_TIMEOUT` (30s) closes a connection
 whose peer completes the handshake and then sends nothing; `UPSTREAM_TIMEOUT` (30s) bounds both the

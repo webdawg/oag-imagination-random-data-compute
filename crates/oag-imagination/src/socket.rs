@@ -549,24 +549,55 @@ pub async fn serve_on_with_limits(
     }
 }
 
+/// How many pad requests may be in flight at once while gathering a file.
+///
+/// A file split across the default `DEFAULT_SHARD_COUNT` (1000) pads would otherwise cost a
+/// thousand sequential round-trips -- one per pad, each waiting for the previous. The gather is
+/// all-or-nothing (`datapad::gather` needs every shard), so fanning out is the only lever; this
+/// bounds how many peers are asked at once so a large manifest does not mean a thousand
+/// simultaneous connections.
+pub const MAX_CONCURRENT_GATHERS: usize = 32;
+
 /// Gathers a file's shards from the given nodes over the TCP carrier and reconstructs it.
 pub async fn gather_file(manifest: &FileManifest, nodes: &[String]) -> Result<Vec<u8>, DataPadError> {
-    gather_file_with(&TcpTransport, manifest, nodes).await
+    gather_file_with(Arc::new(TcpTransport), manifest, nodes).await
 }
 
 /// Same as `gather_file`, over an explicit carrier.
+///
+/// The requests are fanned out with at most [`MAX_CONCURRENT_GATHERS`] in flight, because the
+/// sequential form cost one round-trip per pad and a thousand-pad file is the design case. The
+/// carrier is taken as an `Arc` so the spawned requests can share it; the manifest order is
+/// restored by `datapad::gather`, which sorts by the manifest's `pad_ids`.
 pub async fn gather_file_with(
-    transport: &dyn Transport,
+    transport: Arc<dyn Transport>,
     manifest: &FileManifest,
     nodes: &[String],
 ) -> Result<Vec<u8>, DataPadError> {
-    let mut pads = Vec::new();
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_GATHERS));
+    let mut handles = tokio::task::JoinSet::new();
     for node in nodes {
-        let response = transport
-            .send(node, &Message::PadRequest(PadRequest { pad_id: String::new() }))
-            .await
-            .map_err(|e| DataPadError::Transport(e.to_string()))?;
-        match response {
+        let transport = transport.clone();
+        let node = node.clone();
+        let semaphore = semaphore.clone();
+        handles.spawn(async move {
+            let _permit = semaphore
+                .acquire()
+                .await
+                .map_err(|e| DataPadError::Transport(e.to_string()))?;
+            let response = transport
+                .send(&node, &Message::PadRequest(PadRequest { pad_id: String::new() }))
+                .await
+                .map_err(|e| DataPadError::Transport(e.to_string()))?;
+            Ok::<Message, DataPadError>(response)
+        });
+    }
+    let mut pads = Vec::with_capacity(nodes.len());
+    while let Some(result) = handles.join_next().await {
+        // Two layers: the outer is the task's own join, the inner is the request's result.
+        let message = result
+            .map_err(|e| DataPadError::Transport(e.to_string()))??;
+        match message {
             Message::PadResponse(pad) => pads.push(pad),
             _ => return Err(DataPadError::NotAPad),
         }
@@ -838,6 +869,72 @@ mod tests {
 
         handle_a.abort();
         handle_b.abort();
+    }
+
+    /// The fan-out. A sequential gather costs one round-trip per pad; the bound caps how many are
+    /// in flight. A tracking carrier records the peak concurrency, so the test asserts both that
+    /// every shard still arrives and that the bound holds.
+    #[tokio::test]
+    async fn gathering_fans_out_with_a_bounded_concurrency() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct TrackingTransport {
+            active: Arc<AtomicUsize>,
+            peak: Arc<AtomicUsize>,
+            pads: std::collections::HashMap<String, DataPad>,
+        }
+
+        impl Transport for TrackingTransport {
+            fn send<'a>(
+                &'a self,
+                address: &'a str,
+                _message: &'a Message,
+            ) -> Pin<Box<dyn Future<Output = std::io::Result<Message>> + Send + 'a>> {
+                let pad = self.pads.get(address).cloned();
+                let active = self.active.clone();
+                let peak = self.peak.clone();
+                Box::pin(async move {
+                    let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    match pad {
+                        Some(p) => Ok(Message::PadResponse(p)),
+                        None => Err(std::io::Error::new(std::io::ErrorKind::NotFound, "no pad")),
+                    }
+                })
+            }
+        }
+
+        // Twice the concurrency bound, so a sequential gather would never overlap and an
+        // unbounded one would exceed it.
+        let count = MAX_CONCURRENT_GATHERS * 2;
+        let data: Vec<u8> = (0..100u8).collect();
+        let pad_ids: Vec<String> = (0..count).map(|i| format!("node-{i}")).collect();
+        let (manifest, shards) = datapad::split_to_pads(&data, &pad_ids).unwrap();
+
+        let mut pads = std::collections::HashMap::new();
+        for (id, shard) in pad_ids.iter().zip(shards.iter()) {
+            pads.insert(
+                id.clone(),
+                DataPad { pad_id: id.clone(), values: vec![], shard: Some(shard.clone()) },
+            );
+        }
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let transport = Arc::new(TrackingTransport {
+            active: active.clone(),
+            peak: peak.clone(),
+            pads,
+        });
+
+        let reconstructed = gather_file_with(transport, &manifest, &pad_ids).await.unwrap();
+        assert_eq!(reconstructed, data, "the fan-out must still gather every shard");
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            MAX_CONCURRENT_GATHERS,
+            "the fan-out must be bounded by MAX_CONCURRENT_GATHERS"
+        );
     }
 
     #[tokio::test]
