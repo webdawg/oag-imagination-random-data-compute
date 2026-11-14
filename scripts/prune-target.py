@@ -67,7 +67,13 @@ def live_inodes(profile: Path) -> set[tuple[int, int]]:
     return live
 
 
-def prune_hashed_dir(directory: Path, live: set[tuple[int, int]], keep: int, dry_run: bool) -> tuple[int, int]:
+def prune_hashed_dir(
+    directory: Path,
+    live: set[tuple[int, int]],
+    keep: int,
+    dry_run: bool,
+    protect_after: float = 0.0,
+) -> tuple[int, int]:
     if not directory.is_dir():
         return 0, 0
     groups: dict[str, dict[str, list[Path]]] = {}
@@ -84,6 +90,12 @@ def prune_hashed_dir(directory: Path, live: set[tuple[int, int]], keep: int, dry
         try:
             st = entry.stat()
         except OSError:
+            continue
+        # Never touch an artifact this cargo process is using. Cargo creates its output
+        # paths up front and writes them after the first rustc, so anything newer than the
+        # process start is live even if it looks like an old generation.
+        if protect_after and st.st_mtime >= protect_after:
+            forced.setdefault(stem, set()).add(digest)
             continue
         key = (stem, digest)
         mtimes[key] = max(mtimes.get(key, 0.0), st.st_mtime)
@@ -125,6 +137,7 @@ def prune_generation_dirs(
     keep: int,
     dry_run: bool,
     force_keep: set[str] | None = None,
+    protect_after: float = 0.0,
 ) -> tuple[int, int]:
     if not directory.is_dir():
         return 0, 0
@@ -139,6 +152,13 @@ def prune_generation_dirs(
         try:
             mtime = entry.stat().st_mtime
         except OSError:
+            continue
+        # Cargo creates the incremental/.fingerprint/build directories for the units it is
+        # about to compile before it invokes the first rustc. Deleting one of those while the
+        # build is running makes cargo fail with "failed to write .../invoked.timestamp: No
+        # such file or directory" -- reproduced by `cargo build --examples` after clearing the
+        # fingerprint directory. Anything newer than the cargo process's own start is in use.
+        if protect_after and mtime >= protect_after:
             continue
         groups.setdefault(match.group("stem"), []).append((mtime, match.group("hash"), entry))
 
@@ -230,7 +250,7 @@ def prune_tmp(profile: Path, dry_run: bool) -> tuple[int, int]:
     return removed, freed
 
 
-def prune_target(target: Path, keep: int, dry_run: bool) -> tuple[int, int]:
+def prune_target(target: Path, keep: int, dry_run: bool, protect_after: float = 0.0) -> tuple[int, int]:
     removed = 0
     freed = 0
     for profile_name in ("debug", "release"):
@@ -239,10 +259,10 @@ def prune_target(target: Path, keep: int, dry_run: bool) -> tuple[int, int]:
             continue
         live = live_inodes(profile)
         for count, size in (
-            prune_hashed_dir(profile / "deps", live, keep, dry_run),
-            prune_generation_dirs(profile / "incremental", keep, dry_run),
-            prune_generation_dirs(profile / ".fingerprint", keep, dry_run),
-            prune_generation_dirs(profile / "build", keep, dry_run),
+            prune_hashed_dir(profile / "deps", live, keep, dry_run, protect_after),
+            prune_generation_dirs(profile / "incremental", keep, dry_run, protect_after=protect_after),
+            prune_generation_dirs(profile / ".fingerprint", keep, dry_run, protect_after=protect_after),
+            prune_generation_dirs(profile / "build", keep, dry_run, protect_after=protect_after),
             prune_tmp(profile, dry_run),
         ):
             removed += count
@@ -280,6 +300,9 @@ def main() -> int:
     parser.add_argument("--cargo-pid", default=os.environ.get("PRUNE_CARGO_PID", ""))
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    # Epoch seconds: nothing at or after this time is touched. The wrapper passes the cargo
+    # process's own start time, so a generation cargo is actively using is never pruned.
+    parser.add_argument("--protect-after", type=float, default=0.0)
     args = parser.parse_args()
     if args.keep < 1:
         print("prune-target: --keep must be >= 1", file=sys.stderr)
@@ -308,7 +331,7 @@ def main() -> int:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
         if args.once and once_guard(target, args.cargo_pid):
             return 0
-        removed, freed = prune_target(target, args.keep, args.dry_run)
+        removed, freed = prune_target(target, args.keep, args.dry_run, args.protect_after)
         if not args.dry_run:
             write_stamp(target, args.cargo_pid)
         gib = freed / 1024 / 1024 / 1024

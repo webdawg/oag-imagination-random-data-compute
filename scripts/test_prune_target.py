@@ -129,6 +129,51 @@ class PruneTargetTest(unittest.TestCase):
         self.assertEqual(len(list(fingerprint.glob("serde-*"))), 7)
         self.assertFalse((fingerprint / f"oag-cli-{0:016x}").exists())
 
+    def test_protect_after_skips_generations_cargo_is_using(self):
+        """A generation at or after the cargo process start is never pruned.
+
+        Cargo creates the incremental/.fingerprint directories for the units it is about to
+        compile *before* the first rustc, then writes into them. Deleting one mid-build makes
+        cargo fail with "failed to write .../invoked.timestamp: No such file or directory" --
+        reproduced by `cargo build --examples` after clearing the fingerprint directory.
+        """
+        incremental = self.debug / "incremental"
+        incremental.mkdir()
+        now = 10_000.0
+        for n in range(10):
+            path = incremental / f"oag_mesh-{n:04d}"
+            path.mkdir()
+            # n=0 and n=1 carry the cargo process's own start time: this build is using them.
+            stamp = now if n < 2 else float(n)
+            os.utime(path, (stamp, stamp))
+        self.prune.prune_target(self.target, keep=5, dry_run=False, protect_after=now)
+        left = {path.name for path in incremental.iterdir()}
+        # The two in-use dirs survive despite being the oldest; of the rest, the five newest
+        # are kept and the three oldest go.
+        self.assertEqual(
+            left,
+            {"oag_mesh-0000", "oag_mesh-0001"}
+            | {f"oag_mesh-{n:04d}" for n in range(5, 10)},
+        )
+
+    def test_protect_after_skips_dependency_outputs_cargo_is_writing(self):
+        """The same horizon applies to deps/ outputs, which cargo also creates up front."""
+        now = 10_000.0
+        for n in range(8):
+            path = self.deps / f"oag-{n:016x}"
+            path.write_bytes(b"x")
+            stamp = now if n < 2 else float(n)
+            os.utime(path, (stamp, stamp))
+        self.prune.prune_target(self.target, keep=5, dry_run=False, protect_after=now)
+        left = {path.name for path in self.deps.iterdir()}
+        # The two in-use outputs survive; they count toward the keep, so of the rest the three
+        # newest are kept and the three oldest go.
+        self.assertEqual(
+            left,
+            {"oag-{:016x}".format(0), "oag-{:016x}".format(1)}
+            | {f"oag-{n:016x}" for n in range(5, 8)},
+        )
+
     def test_oag_tmp_files_are_removed_and_foreign_tmp_files_stay(self):
         (self.deps / "oag-0000000000000001.tmpabc").write_bytes(b"t")
         (self.deps / ".oag-0000000000000001.tmpabc").write_bytes(b"t")

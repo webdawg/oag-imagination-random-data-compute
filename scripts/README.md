@@ -73,6 +73,16 @@ why it must never be.
 
 ## Safety guards (do not remove)
 
+0. **The cargo-process horizon.** Cargo creates the `incremental/`, `.fingerprint/`, and `build/`
+   directories for every unit it is about to compile *before* it invokes the first `rustc`, and
+   writes into them afterwards. Deleting one mid-build makes cargo fail with
+   `failed to write .../invoked.timestamp: No such file or directory` -- reproduced by
+   `cargo build --examples` after clearing the fingerprint directory. The wrapper therefore reads
+   the cargo process's own start time (`stat -c %Y /proc/<pid>`) and passes it as
+   `--protect-after`; the pruner skips anything at or after that time. The unit tests
+   `test_protect_after_skips_generations_cargo_is_using` and
+   `test_protect_after_skips_dependency_outputs_cargo_is_writing` pin this.
+
 1. **Repo confinement:** a target resolved from cargo's `--out-dir` is refused
    unless it is inside this repository (`prune-target: refusing ...`). An
    explicitly passed `--target` outside the repo is accepted only if it

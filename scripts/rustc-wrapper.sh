@@ -35,6 +35,16 @@ while [[ "$pid" -gt 1 ]]; do
     [[ -n "$pid" ]] || break
 done
 
+# Cargo creates the incremental/.fingerprint/build directories for every unit it is about to
+# compile *before* it invokes the first rustc, and then writes into them after. Pruning one of
+# those mid-build makes cargo fail with "failed to write .../invoked.timestamp: No such file or
+# directory". The process's own start time is the horizon: anything newer is in use by this
+# build. /proc/<pid>'s mtime is the process start time on Linux.
+protect_after=0
+if [[ -n "$cargo_pid" ]]; then
+    protect_after=$(stat -c %Y "/proc/$cargo_pid" 2>/dev/null || echo 0)
+fi
+
 PRUNE_OUT_DIR="$out" PRUNE_CARGO_PID="$cargo_pid" \
-    python3 "$HERE/prune-target.py" --once --keep 5 --out-dir "$out"
+    python3 "$HERE/prune-target.py" --once --keep 5 --out-dir "$out" --protect-after "$protect_after"
 exec "$@"
