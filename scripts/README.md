@@ -5,10 +5,10 @@ workspace build) stop filling the disk. One fresh build is almost entirely
 full-debug `oag*` binaries, incremental dirs, and fingerprints; third-party
 dependency artifacts are comparatively small and are **never touched**.
 
-The same three files exist, byte-identical, in all four repositories:
+The same three files exist, byte-identical, in all five repositories:
 `rust-ai` (open-agent-graph), `oag-mesh`, `oag-collisions`,
-`oag-imagination-random-data-compute`. If you change one, copy the change to
-the other three.
+`oag-imagination-random-data-compute`, `oag-listend`. If you change one, copy the change to
+the other four.
 
 ## Files
 
@@ -33,8 +33,8 @@ rustc-wrapper = "scripts/rustc-wrapper.sh"
 - At ~6 GB per dev build, this caps a repo's `target/` at roughly **36 GB**
   worst case (the unpruned `rust-ai/target` had reached 124 GB).
 - **The knob is the `--keep 5` argument in `scripts/rustc-wrapper.sh`.** To
-  change the policy, edit it there — in all four repositories, since the
-  copies must stay identical. (`KEEP = 5` in `prune-target.py` is only the
+  change the policy, edit it there — in all five repositories, since the
+  copies must stay identical across all five. (`KEEP = 5` in `prune-target.py` is only the
   default when no `--keep` is passed.)
 
 ## Running the tests
