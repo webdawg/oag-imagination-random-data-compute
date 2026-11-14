@@ -1,0 +1,3 @@
+[build]
+# Before the first rustc of a cargo run, drop old oag artifacts down to 5 builds.
+rustc-wrapper = "scripts/rustc-wrapper.sh"

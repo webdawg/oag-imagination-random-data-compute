@@ -5,3 +5,7 @@
 *.sqlite-wal
 identity.key
 .env
+
+# Python test/tooling bytecode
+__pycache__/
+*.pyc
