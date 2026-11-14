@@ -234,16 +234,46 @@ pub fn genesis_previous() -> [u8; 32] {
     [0u8; 32]
 }
 
+/// The minimum routing weight as a fraction of the routing slots' mean.
+///
+/// `route` floors every weight at this fraction of the mean, so a neighbour that has been
+/// penalized without limit keeps a bounded share of traffic and can still be re-selected,
+/// re-reinforced, and recovered. This is the exploration guarantee the pad needs: the weights
+/// carry learned preference, and the floor only bounds how far a neighbour can fall.
+///
+/// It is a *relative* floor, not the absolute `1e-6` it replaces. The pad is normalized to
+/// [`PAD_MEAN`] over [`PAD_DIM`] slots, so an absolute constant is meaningless at that scale: a
+/// slot penalized without limit falls to denormal `f32` (about `1e-45`), where the old floor gave
+/// it a share of about `1e-8` and it was effectively frozen. Measured in `examples/convergence.rs`:
+/// a switch at decision 10,000 took **1,061** decisions to recover, because the initial ratio was
+/// about `1e45` and the ratio decays by `exp(-HOP_STEP)` per decision. A floor at a fraction of the
+/// mean caps the initial ratio at about `neighbours / PAD_FLOOR_FRAC`, so recovery is bounded at
+/// `ln(neighbours / PAD_FLOOR_FRAC) / HOP_STEP` decisions -- about 60 for four neighbours --
+/// however long the lock-in lasted.
+///
+/// The cost is that a neighbour the pad has learned to avoid keeps a small share of traffic
+/// (`PAD_FLOOR_FRAC / neighbours` of the distribution). That is the price of being able to
+/// *unlearn* it, and it is measured rather than guessed.
+pub const PAD_FLOOR_FRAC: f64 = 0.01;
+
 /// Picks the next hop using the pad. The pad's values are weights over the neighbors; the node
 /// picks weighted by the pad, so traffic follows the strongest pads. A zero pad does not make a
-/// neighbor unreachable -- every neighbor keeps a small floor.
+/// neighbor unreachable -- every neighbor keeps a floor at [`PAD_FLOOR_FRAC`] of the routing
+/// slots' mean, so a penalized neighbour stays explorable.
 pub fn route(pad: &[f32], neighbors: &[String], seed: &[u8; 32]) -> Option<String> {
     if neighbors.is_empty() {
         return None;
     }
-    let weights: Vec<f64> = (0..neighbors.len())
-        .map(|i| pad.get(i).copied().unwrap_or(0.0).max(0.0) as f64 + 1e-6)
+    let raw: Vec<f64> = (0..neighbors.len())
+        .map(|i| pad.get(i).copied().unwrap_or(0.0).max(0.0) as f64)
         .collect();
+    // Relative to the routing slots' own mean, not to `PAD_MEAN`: the pad is normalized over all
+    // `PAD_DIM` slots, so the first `neighbours.len()` of them can sum to more or less than
+    // `neighbours.len()`. A fresh all-zero pad has mean zero, and the tiny absolute floor keeps the
+    // division below well-defined and the routing uniform, exactly as before.
+    let mean = raw.iter().sum::<f64>() / raw.len() as f64;
+    let floor = (mean * PAD_FLOOR_FRAC).max(1e-12);
+    let weights: Vec<f64> = raw.iter().map(|w| w.max(floor)).collect();
     let total: f64 = weights.iter().sum();
 
     let mut hasher = blake3::Hasher::new();
@@ -371,6 +401,42 @@ fn normalize(pad: &mut [f32]) {
     }
 }
 
+/// Floors the first `n` slots at [`PAD_FLOOR_FRAC`] of the routing slots' mean, then rescales so
+/// the pad's mean is still [`PAD_MEAN`]. `n` is the neighbour count: the slots past it are padding
+/// for neighbours this node does not have, and flooring them would give the padding a weight it
+/// should not carry.
+///
+/// This is what makes the floor a property of the *stored* pad rather than only of [`route`].
+/// Without it the losing slots are multiplied by `hop_failed_penalty` without limit and fall to
+/// denormal `f32` (~1e-45), so the stored ratio between the strongest and weakest routing slot is
+/// about 1e45 and the pad takes ~1,000 decisions to recover from a lock-in -- measured in
+/// `examples/convergence.rs`. Flooring caps that ratio at about `n / PAD_FLOOR_FRAC`, so recovery
+/// is bounded at `ln(n / PAD_FLOOR_FRAC) / HOP_STEP` decisions however long the lock-in lasted.
+///
+/// An all-zero routing set is left alone: its mean is zero, and [`route`]'s floor already makes it
+/// uniform.
+fn floor_routing_slots(pad: &mut [f32], n: usize) {
+    let n = n.min(pad.len());
+    if n == 0 {
+        return;
+    }
+    let mean = pad[..n].iter().sum::<f32>() / n as f32;
+    if !(mean > 0.0) {
+        return;
+    }
+    let floor = mean * PAD_FLOOR_FRAC as f32;
+    let mut changed = false;
+    for slot in pad[..n].iter_mut() {
+        if *slot < floor {
+            *slot = floor;
+            changed = true;
+        }
+    }
+    if changed {
+        normalize(pad);
+    }
+}
+
 /// The engine: a node's pad, its neighbors, and its saved dreams.
 #[derive(Debug)]
 pub struct Engine {
@@ -428,6 +494,7 @@ impl Engine {
             }
         }
         normalize(&mut pad);
+        floor_routing_slots(&mut pad, neighbors.len());
         Self { node_id, pad, neighbors, dreams: DreamLog::new(), shard: None, source }
     }
 
@@ -511,6 +578,9 @@ impl Engine {
             HopOutcome::Failed => self.pad[index] *= hop_failed_penalty(),
         }
         normalize(&mut self.pad);
+        // Floor after normalizing, so the stored pad -- not just `route`'s view of it -- keeps a
+        // bounded ratio and a penalized neighbour stays recoverable. See [`PAD_FLOOR_FRAC`].
+        floor_routing_slots(&mut self.pad, self.neighbors.len());
     }
 }
 
@@ -821,6 +891,111 @@ mod tests {
         assert!(
             after > before,
             "a reinforced neighbour must take a larger share, {before} -> {after}"
+        );
+    }
+
+    /// The defect this guards: the old absolute `1e-6` floor was meaningless against a pad
+    /// normalized to `PAD_MEAN`, so a slot penalized without limit fell to denormal `f32`
+    /// (~1e-45) and shared ~1e-8 of the traffic. It could be re-selected only by luck, so recovery
+    /// from a deep lock-in was unbounded -- measured at 1,061 decisions in `examples/convergence.rs`.
+    #[test]
+    fn a_penalized_neighbour_keeps_a_bounded_share() {
+        let neighbors = vec!["node-a".to_string(), "node-b".to_string(), "node-c".to_string()];
+        let seeds: Vec<[u8; 32]> = (0..256u32)
+            .map(|i| {
+                let mut seed = [0u8; 32];
+                seed[..4].copy_from_slice(&i.to_le_bytes());
+                seed
+            })
+            .collect();
+        let share_of = |pad: &[f32], target: &str| {
+            seeds
+                .iter()
+                .filter(|seed| route(pad, &neighbors, seed).as_deref() == Some(target))
+                .count()
+        };
+
+        // One dominant slot, two driven to exactly zero -- the state a long lock-in leaves behind.
+        let pad = [1000.0_f32, 0.0, 0.0];
+        let floored = share_of(&pad, "node-b");
+        assert!(
+            floored > 0,
+            "a penalized neighbour must keep a bounded share of traffic, got {floored}/256"
+        );
+        // The floor is PAD_FLOOR_FRAC of the routing slots' mean, so the share is about
+        // PAD_FLOOR_FRAC / neighbours.
+        let expected = PAD_FLOOR_FRAC / neighbors.len() as f64;
+        let actual = floored as f64 / seeds.len() as f64;
+        assert!(
+            actual > expected * 0.5,
+            "the floored share {actual:.4} should be on the order of {expected:.4}"
+        );
+    }
+
+    /// The floor is a property of the *stored* pad, not only of `route`'s view of it. A pad that
+    /// only `route` floored would still hold denormal losing slots, and the stored ratio -- the
+    /// thing recovery is measured against -- would still be ~1e45.
+    #[test]
+    fn the_stored_pad_keeps_a_bounded_ratio() {
+        let mut engine = Engine::new(
+            "node-a".to_string(),
+            vec![1.0; PAD_DIM],
+            vec!["node-b".to_string(), "node-c".to_string(), "node-d".to_string()],
+        );
+        for _ in 0..1_000 {
+            engine.observe_hop("node-b", HopOutcome::Answered);
+            engine.observe_hop("node-c", HopOutcome::Failed);
+            engine.observe_hop("node-d", HopOutcome::Failed);
+        }
+        let max = engine.pad[..3].iter().copied().fold(0.0f32, f32::max);
+        let min = engine.pad[..3].iter().copied().fold(f32::MAX, f32::min);
+        let ratio = max / min;
+        // Three neighbours and PAD_FLOOR_FRAC = 0.01 cap the ratio at about 300.
+        assert!(
+            ratio <= 400.0,
+            "the stored ratio must be bounded by the floor, got {ratio}"
+        );
+    }
+
+    /// Recovery from a deep lock-in is bounded by the floor, not by how long the lock-in lasted.
+    /// Measured before the floor: 1,061 decisions. With the floor, the stored ratio is capped at
+    /// about `neighbours / PAD_FLOOR_FRAC`, so recovery is bounded at `ln(ratio) / HOP_STEP`.
+    #[tokio::test]
+    async fn recovery_from_a_deep_lock_in_is_bounded_by_the_floor() {
+        let neighbours: Vec<String> = (0..4).map(|i| format!("node-{i}")).collect();
+        let mut engine = Engine::new(
+            "measuring-node".to_string(),
+            vec![1.0; PAD_DIM],
+            neighbours.clone(),
+        );
+        let resolver = LocalResolver::new(); // never answers
+
+        let decisions = 4_000usize;
+        let switch_at = 2_000usize;
+        let mut recovery: Option<usize> = None;
+        for i in 0..decisions {
+            let mut request = request("req");
+            let good_now = if i >= switch_at { 1 } else { 0 };
+            if let HandleOutcome::RouteTo(next) = engine.handle(&mut request, &resolver).await {
+                let index = neighbours.iter().position(|n| n == &next).expect("routed neighbour");
+                let outcome = if good_now == index {
+                    HopOutcome::Answered
+                } else {
+                    HopOutcome::Failed
+                };
+                engine.observe_hop(&next, outcome);
+                if i >= switch_at && recovery.is_none() && engine.pad[1] > engine.pad[0] {
+                    recovery = Some(i - switch_at + 1);
+                }
+            }
+        }
+
+        let recovery = recovery.expect("the pad must recover from the lock-in");
+        // Four neighbours and PAD_FLOOR_FRAC = 0.01 cap the stored ratio at about 400, so recovery
+        // is bounded at ln(400) / HOP_STEP ~ 60 decisions. The discrete, seeded draw adds slack.
+        assert!(
+            recovery <= 200,
+            "recovery must be bounded by the floor, took {recovery} decisions"
         );
     }
 

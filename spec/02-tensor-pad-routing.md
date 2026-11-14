@@ -68,10 +68,25 @@ The pad is not over-designed. The mechanisms around it change it, and the traffi
 ### The pad must cover every neighbour, and they must be explorable
 
 `route` picks weighted by the pad, so a neighbour with weight `0` -- or with no slot at all --
-shares only the `1e-6` floor with slots that have been reinforced, and is never chosen often
-enough to be reinforced in turn. That deadlock (no traffic, so no reinforcement, so no traffic)
-meant the pad could strengthen a path and let the others lose share, but could never *form* one:
-a neighbour the pad did not cover was frozen out for the life of the process.
+would share only a floor with slots that have been reinforced, and be never chosen often enough
+to be reinforced in turn. That deadlock (no traffic, so no reinforcement, so no traffic) meant the
+pad could strengthen a path and let the others lose share, but could never *form* one: a neighbour
+the pad did not cover was frozen out for the life of the process.
+
+The floor is **relative**, not absolute. An earlier version added a constant `1e-6`, which was
+meaningless against a pad normalized to `PAD_MEAN` over `PAD_DIM` slots: a slot penalized without
+limit fell to denormal `f32` (about `1e-45`), where the constant gave it a share of about `1e-8`
+and it was effectively frozen. Measured in `examples/convergence.rs`: a switch at decision 10,000
+took **1,061** decisions to recover, because the stored ratio between the strongest and weakest
+routing slot was about `1e45` and the ratio decays by `exp(-HOP_STEP)` per decision.
+
+`PAD_FLOOR_FRAC` (0.01) floors every routing slot at a fraction of the routing slots' mean, both
+in `route` and in the stored pad after every reinforcement. That caps the stored ratio at about
+`neighbours / PAD_FLOOR_FRAC`, so recovery is bounded at `ln(neighbours / PAD_FLOOR_FRAC) /
+HOP_STEP` decisions -- about 60 for four neighbours -- however long the lock-in lasted. Measured
+after the change: the same switch recovers in **69** decisions. The cost is that a neighbour the pad
+has learned to avoid keeps a small share of traffic (`PAD_FLOOR_FRAC / neighbours`); that is the
+price of being able to unlearn it.
 
 The pad and the neighbour list come from different layers and nothing reconciled them, so this was
 reachable with no misconfiguration -- `node.rs` passes the stored pad and the neighbour list

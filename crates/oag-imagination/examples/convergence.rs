@@ -21,6 +21,14 @@
 //!
 //! The source is `BLAKE3(counter)`, so a run is exactly reproducible.
 
+//! **Recovery is bounded, not just observed.** `--switch-at` changes the answering neighbour
+//! mid-run and reports when the new neighbour's weight overtakes the old one's. Before the
+//! `PAD_FLOOR_FRAC` floor, a switch at decision 10,000 took 1,061 decisions to recover, because the
+//! stored ratio was about 1e45. With the floor the ratio is capped at about
+//! `neighbours / PAD_FLOOR_FRAC`, so recovery is bounded at `ln(ratio) / HOP_STEP` -- measured at 69
+//! decisions for four neighbours. The floor is what makes the pad able to *unlearn* a path, not just
+//! learn one.
+
 use std::time::Instant;
 
 use oag_imagination::{
