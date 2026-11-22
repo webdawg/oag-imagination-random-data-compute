@@ -16,10 +16,18 @@ import fcntl
 import os
 import re
 import sys
+import time
 from pathlib import Path
 
 KEEP = 5
 HASHED = re.compile(r"^(?P<stem>.+)-(?P<hash>[0-9a-f]{16})(?P<rest>\..*)?$")
+# A generation younger than this is never pruned, whatever cargo is doing. The cargo-process
+# horizon stops one cargo run deleting outputs it is writing, but a *new* cargo run starts after
+# the previous one finished, so its horizon is later than artifacts the previous run just wrote.
+# A gate that runs several cargo commands back to back could delete them mid-run and fail with
+# "failed to write .../invoked.timestamp". Protecting the last few minutes closes that.
+RECENT_WINDOW = 1800.0
+
 INCREMENTAL = re.compile(r"^(?P<stem>.+)-(?P<hash>[0-9A-Za-z]+)$")
 
 
@@ -132,6 +140,29 @@ def prune_hashed_dir(
     return removed, freed
 
 
+def generation_age(path: Path) -> float:
+    """When a generation was last written.
+
+    Cargo creates a fingerprint directory once and then rewrites the files inside it on every
+    build, so the directory's own mtime goes stale while its contents are fresh. Ageing a
+    generation by its directory mtime would therefore prune a directory cargo is still using.
+    The newest mtime of the directory and its immediate children is the honest answer.
+    """
+    try:
+        newest = path.stat().st_mtime
+    except OSError:
+        return 0.0
+    try:
+        for child in path.iterdir():
+            try:
+                newest = max(newest, child.stat().st_mtime)
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return newest
+
+
 def prune_generation_dirs(
     directory: Path,
     keep: int,
@@ -149,10 +180,7 @@ def prune_generation_dirs(
         match = pattern.match(entry.name)
         if not match or not is_oag(match.group("stem")):
             continue
-        try:
-            mtime = entry.stat().st_mtime
-        except OSError:
-            continue
+        mtime = generation_age(entry)
         # Cargo creates the incremental/.fingerprint/build directories for the units it is
         # about to compile before it invokes the first rustc. Deleting one of those while the
         # build is running makes cargo fail with "failed to write .../invoked.timestamp: No
@@ -325,13 +353,18 @@ def main() -> int:
         return 0
 
 
+    # Never prune a generation younger than the recent window, whatever cargo is doing. On top
+    # of that, the wrapper passes the running cargo process's start time, so the outputs cargo
+    # is actively writing are protected too.
+    protect_after = max(args.protect_after, time.time() - RECENT_WINDOW)
+
     lock_path = target / ".prune.lock"
     lock_path.touch(exist_ok=True)
     with lock_path.open("a") as lock_file:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
         if args.once and once_guard(target, args.cargo_pid):
             return 0
-        removed, freed = prune_target(target, args.keep, args.dry_run, args.protect_after)
+        removed, freed = prune_target(target, args.keep, args.dry_run, protect_after)
         if not args.dry_run:
             write_stamp(target, args.cargo_pid)
         gib = freed / 1024 / 1024 / 1024

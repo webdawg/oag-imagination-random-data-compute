@@ -2,7 +2,7 @@
 """Tests for prune-target.py and rustc-wrapper.sh.
 
 Run:      python3 scripts/test_prune_target.py
-Expected: Ran 14 tests ... OK, in under a second.
+Expected: Ran 19 tests ... OK, in under a second.
 
 Scope and safety:
 - Most tests build a synthetic cargo target tree in a tempdir and never touch
@@ -228,6 +228,60 @@ class PruneTargetTest(unittest.TestCase):
         )
         self.assertEqual(second.stderr, "")
         self.assertTrue(extra.is_file())
+
+    def test_a_fresh_generation_survives_without_a_cargo_horizon(self):
+        """A second cargo run starts after the first finished, so its horizon is later than the
+        artifacts the first just wrote. Without a recent window those would be deleted while
+        still needed. The write_hash helper back-dates its files, so these are written "now".
+        """
+        for i in range(8):
+            # Deliberately not self.write_hash, which back-dates its files to 1970.
+            (self.deps / f"oag-{i:016x}").write_bytes(b"x")
+        # Go through the CLI: the recent window is applied there, not by a caller passing 0.
+        subprocess.run(
+            ["python3", str(SCRIPT), "--target", str(self.target), "--keep", "5"],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=script_env(),
+        )
+        self.assertEqual(len(self.names()), 8)
+        self.assertEqual(len(self.names()), 8)
+
+    def test_a_reused_generation_dir_with_fresh_contents_is_kept(self):
+        """Cargo reuses a fingerprint directory across builds, rewriting the files inside it, so
+        the directory mtime goes stale while the contents are fresh. A generation aged by its
+        directory mtime alone is pruned while cargo is still using it, which is exactly the
+        release-gate flake this closes.
+        """
+        for n in range(8):
+            gen = self.target / "release" / ".fingerprint" / f"oag-listend-{n:016x}"
+            gen.mkdir(parents=True)
+            (gen / "invoked.timestamp").write_bytes(b"x")
+            # The directory itself looks old; its contents were written just now.
+            os.utime(gen, (0, 0))
+        subprocess.run(
+            ["python3", str(SCRIPT), "--target", str(self.target), "--keep", "5"],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=script_env(),
+        )
+        left = list((self.target / "release" / ".fingerprint").iterdir())
+        self.assertEqual(len(left), 8, "fresh contents must protect the directory")
+
+    def test_cli_keeps_a_fresh_generation(self):
+        """Same guarantee through the CLI, which is the path the wrapper drives."""
+        for i in range(8):
+            (self.deps / f"oag-{i:016x}").write_bytes(b"x")
+        subprocess.run(
+            ["python3", str(SCRIPT), "--target", str(self.target), "--keep", "5"],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=script_env(),
+        )
+        self.assertEqual(len(self.names()), 8)
 
     def test_cli_rejects_keep_below_one_and_missing_target_is_a_noop(self):
         bad = subprocess.run(["python3", str(SCRIPT), "--target", str(self.target), "--keep", "0"], capture_output=True, text=True, env=script_env())
