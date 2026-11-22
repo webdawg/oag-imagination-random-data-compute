@@ -356,7 +356,15 @@ def main() -> int:
     # Never prune a generation younger than the recent window, whatever cargo is doing. On top
     # of that, the wrapper passes the running cargo process's start time, so the outputs cargo
     # is actively writing are protected too.
-    protect_after = max(args.protect_after, time.time() - RECENT_WINDOW)
+    # The bound is the *earlier* of the two thresholds, because `protect_after` means "skip
+    # anything at or after this time" -- a later bound protects more, so taking the maximum
+    # would silently discard the recent window whenever a cargo horizon existed. Taking the
+    # minimum protects the union: this cargo's outputs *and* the last half hour's.
+    #
+    # A horizon of 0 means the caller supplied none (the CLI default), so only the recent
+    # window applies.
+    recent = time.time() - RECENT_WINDOW
+    protect_after = recent if args.protect_after <= 0.0 else min(args.protect_after, recent)
 
     lock_path = target / ".prune.lock"
     lock_path.touch(exist_ok=True)

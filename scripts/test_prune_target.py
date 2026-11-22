@@ -2,7 +2,7 @@
 """Tests for prune-target.py and rustc-wrapper.sh.
 
 Run:      python3 scripts/test_prune_target.py
-Expected: Ran 19 tests ... OK, in under a second.
+Expected: Ran 20 tests ... OK, in under a second.
 
 Scope and safety:
 - Most tests build a synthetic cargo target tree in a tempdir and never touch
@@ -23,6 +23,7 @@ import importlib.util
 import os
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -282,6 +283,39 @@ class PruneTargetTest(unittest.TestCase):
             env=script_env(),
         )
         self.assertEqual(len(self.names()), 8)
+
+    def test_the_cargo_horizon_and_the_recent_window_protect_the_union(self):
+        """The bound is the *earlier* of the two thresholds. Taking the later one (the maximum)
+        would discard the recent window whenever a cargo horizon is supplied -- exactly the
+        release-gate flake, because cargo reuses fingerprint directories across runs, so their
+        mtimes predate the new cargo process's start.
+        """
+        written = time.time() - 60.0
+        for i in range(8):
+            gen = self.target / "release" / ".fingerprint" / f"oag-listend-{i:016x}"
+            gen.mkdir(parents=True)
+            child = gen / "invoked.timestamp"
+            child.write_bytes(b"x")
+            # A minute old, directory and contents alike: exactly a reused generation from the
+            # previous cargo run. Back-dating only the child would leave the directory's own
+            # mtime at "now" and protect it for the wrong reason.
+            os.utime(child, (written, written))
+            os.utime(gen, (written, written))
+        # The caller passes a horizon of *now*, as the wrapper does for a cargo process that
+        # started after these were written. Both thresholds apply, so nothing here is old
+        # enough to prune.
+        subprocess.run(
+            [
+                "python3", str(SCRIPT), "--target", str(self.target), "--keep", "5",
+                "--protect-after", str(int(time.time())),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=script_env(),
+        )
+        left = list((self.target / "release" / ".fingerprint").iterdir())
+        self.assertEqual(len(left), 8, "a recent generation must survive a cargo horizon")
 
     def test_cli_rejects_keep_below_one_and_missing_target_is_a_noop(self):
         bad = subprocess.run(["python3", str(SCRIPT), "--target", str(self.target), "--keep", "0"], capture_output=True, text=True, env=script_env())

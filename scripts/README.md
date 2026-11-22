@@ -83,14 +83,19 @@ why it must never be.
    `test_protect_after_skips_generations_cargo_is_using` and
    `test_protect_after_skips_dependency_outputs_cargo_is_writing` pin this.
 
-0b. **The recent window.** Guard 0 protects the outputs of the cargo process that is running.
-   A *new* cargo run starts after the previous one finished, so its horizon is later than the
-   artifacts the previous run just wrote, and a gate that runs several cargo commands back to
-   back could delete them mid-run. `main()` therefore clamps the bound to
-   `max(--protect-after, now - 30 min)`, so a generation written within the last 30 minutes is
-   never pruned whatever cargo is doing. Pinned by
-   `test_a_fresh_generation_survives_without_a_cargo_horizon` and
-   `test_cli_keeps_a_fresh_generation`.
+0b. **The recent window, and the bound is the *earlier* threshold.** Guard 0 protects the
+   outputs of the cargo process that is running. A *new* cargo run starts after the previous one
+   finished, so its horizon is later than the artifacts the previous run just wrote, and a gate
+   that runs several cargo commands back to back could delete them mid-run. `main()` therefore
+   takes `min(--protect-after, now - 30 min)`. The minimum is the whole point: `protect_after`
+   means "skip anything at or after this time", so a *later* bound protects more, and taking the
+   maximum would silently discard the recent window whenever a cargo horizon was supplied -- which
+   is exactly how the release gate kept failing. Taking the minimum protects the union: this
+   cargo's outputs *and* the last half hour's. A horizon of 0 (the CLI default) means the caller
+   supplied none, so only the window applies. Pinned by
+   `test_a_fresh_generation_survives_without_a_cargo_horizon`,
+   `test_cli_keeps_a_fresh_generation`, and
+   `test_the_cargo_horizon_and_the_recent_window_protect_the_union`.
 
 0c. **Age by contents, not by the directory.** Cargo reuses a fingerprint directory across builds
    and rewrites the files inside it, so the directory's own mtime goes stale while its contents
