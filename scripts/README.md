@@ -43,7 +43,7 @@ rustc-wrapper = "scripts/rustc-wrapper.sh"
 python3 scripts/test_prune_target.py
 ```
 
-Expected: `Ran 14 tests ... OK` in under a second. The suite builds synthetic
+Expected: `Ran 19 tests ... OK` in under a second. The suite builds synthetic
 target trees in a tempdir; two tests additionally touch the real
 `target/debug/deps` using only files named `oag_wrapper_probe-*` (created,
 asserted on, deleted — never anything cargo made). It is safe to run at any
@@ -82,6 +82,21 @@ why it must never be.
    `--protect-after`; the pruner skips anything at or after that time. The unit tests
    `test_protect_after_skips_generations_cargo_is_using` and
    `test_protect_after_skips_dependency_outputs_cargo_is_writing` pin this.
+
+0b. **The recent window.** Guard 0 protects the outputs of the cargo process that is running.
+   A *new* cargo run starts after the previous one finished, so its horizon is later than the
+   artifacts the previous run just wrote, and a gate that runs several cargo commands back to
+   back could delete them mid-run. `main()` therefore clamps the bound to
+   `max(--protect-after, now - 30 min)`, so a generation written within the last 30 minutes is
+   never pruned whatever cargo is doing. Pinned by
+   `test_a_fresh_generation_survives_without_a_cargo_horizon` and
+   `test_cli_keeps_a_fresh_generation`.
+
+0c. **Age by contents, not by the directory.** Cargo reuses a fingerprint directory across builds
+   and rewrites the files inside it, so the directory's own mtime goes stale while its contents
+   are fresh. A generation is aged by the newest mtime of the directory and its immediate children
+   (`generation_age`), not by the directory alone. Pinned by
+   `test_a_reused_generation_dir_with_fresh_contents_is_kept`.
 
 1. **Repo confinement:** a target resolved from cargo's `--out-dir` is refused
    unless it is inside this repository (`prune-target: refusing ...`). An
